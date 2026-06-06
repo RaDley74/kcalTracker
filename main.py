@@ -12,6 +12,7 @@ from logging.handlers import RotatingFileHandler
 
 ENV_FILE = ".env"
 
+
 def _ensure_env() -> None:
     if not os.path.exists(ENV_FILE):
         with open(ENV_FILE, "w", encoding="utf-8") as f:
@@ -38,6 +39,7 @@ def _ensure_env() -> None:
             if key and value and key not in os.environ:
                 os.environ[key] = value
 
+
 _ensure_env()
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -47,7 +49,7 @@ _ensure_env()
 LOGS_DIR = "logs"
 os.makedirs(LOGS_DIR, exist_ok=True)
 
-# ANSI-цвета для консоли
+
 class _Color:
     RESET   = "\033[0m"
     GREY    = "\033[90m"
@@ -57,6 +59,8 @@ class _Color:
     RED     = "\033[91m"
     MAGENTA = "\033[95m"
     BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+
 
 LEVEL_COLORS = {
     "DEBUG":    _Color.GREY,
@@ -66,27 +70,38 @@ LEVEL_COLORS = {
     "CRITICAL": _Color.MAGENTA,
 }
 
+# Иконки для уровней — сразу видно в терминале
+LEVEL_ICONS = {
+    "DEBUG":    "·",
+    "INFO":     "✓",
+    "WARNING":  "⚠",
+    "ERROR":    "✗",
+    "CRITICAL": "☠",
+}
+
+
 class _ConsoleFormatter(logging.Formatter):
     """Красивый цветной форматтер для терминала."""
 
-    WIDTH = 22   # ширина поля имени логгера
+    WIDTH = 20  # ширина поля имени логгера
 
     def format(self, record: logging.LogRecord) -> str:
-        ts      = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
-        level   = record.levelname
-        color   = LEVEL_COLORS.get(level, "")
-        name    = record.name.split(".")[-1][:self.WIDTH].ljust(self.WIDTH)
-        msg     = record.getMessage()
+        ts    = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+        level = record.levelname
+        color = LEVEL_COLORS.get(level, "")
+        icon  = LEVEL_ICONS.get(level, "?")
+        name  = record.name.split(".")[-1][:self.WIDTH].ljust(self.WIDTH)
+        msg   = record.getMessage()
 
-        # Многострочные сообщения красиво делаем с отступом
+        # Многострочные сообщения с отступом
         if "\n" in msg:
+            indent = " " * (len(ts) + 3 + 2 + 3 + self.WIDTH + 3)
             lines  = msg.splitlines()
-            indent = " " * (len(ts) + 3 + len(level) + 3 + self.WIDTH + 3)
             msg    = lines[0] + "\n" + "\n".join(indent + l for l in lines[1:])
 
         line = (
-            f"{_Color.GREY}{ts}{_Color.RESET} "
-            f"{color}{_Color.BOLD}{level:<8}{_Color.RESET} "
+            f"{_Color.DIM}{ts}{_Color.RESET} "
+            f"{color}{icon} {_Color.BOLD}{level:<8}{_Color.RESET} "
             f"{_Color.CYAN}{name}{_Color.RESET}  "
             f"{msg}"
         )
@@ -349,13 +364,45 @@ CANCEL_KEYBOARD = ReplyKeyboardMarkup(
 def _today() -> str:
     return date.today().isoformat()
 
+
 def _days_ago(n: int) -> str:
     return (date.today() - timedelta(days=n)).isoformat()
 
+
 def _progress_bar(current: int, goal: int, width: int = 10) -> str:
-    pct    = min(current / goal, 1.0) if goal > 0 else 0
-    filled = round(pct * width)
-    return "🟩" * filled + "⬜" * (width - filled) + f" {round(pct * 100)}%"
+    """
+    Динамичный прогресс-бар с цветовой индикацией:
+      🟩 зелёный — до 80% нормы
+      🟨 жёлтый  — 80–100%
+      🟥 красный  — при превышении нормы
+    """
+    if goal <= 0:
+        return "⬜" * width + " 0%"
+
+    pct         = current / goal
+    filled      = min(round(pct * width), width)
+    pct_display = round(pct * 100)
+
+    if pct <= 0.80:
+        bar = "🟩" * filled + "⬜" * (width - filled)
+    elif pct <= 1.0:
+        bar = "🟨" * filled + "⬜" * (width - filled)
+    else:
+        bar = "🟥" * width  # весь бар красный при превышении
+
+    return f"{bar} {pct_display}%"
+
+
+def _kcal_badge(kcal: int) -> str:
+    """Цветной значок калорийности для списка приёмов пищи."""
+    if kcal < 100:
+        return "🟢"   # лёгкий перекус
+    elif kcal < 300:
+        return "🟡"   # средний приём
+    elif kcal < 600:
+        return "🟠"   # калорийное блюдо
+    return "🔴"        # очень калорийно
+
 
 def _format_deficit_block(stats: dict, label: str) -> str:
     td      = stats["total_deficit"]
@@ -378,6 +425,7 @@ def _format_deficit_block(stats: dict, label: str) -> str:
         f"   ⚠️ Дней с профицитом: {stats['days_surplus']}",
     ])
 
+
 def _forecast(avg_daily_deficit: int) -> str:
     if avg_daily_deficit <= 0:
         return "📌 _Для прогноза нужен средний дефицит > 0 ккал/день_"
@@ -395,16 +443,11 @@ def _forecast(avg_daily_deficit: int) -> str:
     lines.append("\n_* 1 кг жира ≈ 7700 ккал_")
     return "\n".join(lines)
 
+
 def _sync_user(update: Update) -> None:
     u = update.effective_user
     db_ensure_user(u.id, u.username, u.full_name)
 
-def _send_chunks(chunks: list[list[str]]):
-    """Вспомогательная функция: возвращает список строк-частей."""
-    result = []
-    for part in chunks:
-        result.append("\n".join(part))
-    return result
 
 def _split_message(lines: list[str], limit: int = 3800) -> list[list[str]]:
     chunk, chunks = [], []
@@ -416,6 +459,7 @@ def _split_message(lines: list[str], limit: int = 3800) -> list[list[str]]:
     chunks.append(chunk)
     return chunks
 
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -423,14 +467,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     logger.info("Команда /start: user_id=%d (%s)", u.id, u.full_name)
     await update.message.reply_text(
-        f"Привет, {u.first_name}! 👋\n\n"
+        f"Привет, *{u.first_name}*! 👋\n\n"
         "Я помогу отслеживать калории и считать дефицит.\n\n"
+        "📌 *Команды:*\n"
         "/add — добавить приём пищи\n"
         "/summary — сводка за сегодня\n"
         "/deficit — дефицит калорий\n"
         "/history — вся история\n"
         "/goal — установить дневную цель\n"
-        "/clear — очистить данные за сегодня",
+        "/clear — очистить данные за сегодня\n\n"
+        "_Или просто используй кнопки меню 👇_",
+        parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -448,7 +495,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  — дефицит за сегодня\n"
         "  — дефицит за 7 дней и за всё время\n"
         "  — прогноз похудения\n\n"
-        "🎯 Установи цель через кнопку *Установить цель*",
+        "🎯 Установи цель через кнопку *Установить цель*\n\n"
+        "🎨 *Значки калорийности:*\n"
+        "🟢 < 100 ккал   🟡 100–299   🟠 300–599   🔴 600+",
         parse_mode="MarkdownV2",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -481,6 +530,8 @@ async def received_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if len(parts) == 2:
         try:
             kcal = int(parts[1])
+            if kcal <= 0:
+                raise ValueError
             context.user_data["food_name"] = parts[0]
             context.user_data["food_kcal"] = kcal
             logger.debug("Быстрый ввод: user_id=%d «%s» %d ккал", uid, parts[0], kcal)
@@ -520,9 +571,10 @@ async def received_calories(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def _save_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    name = context.user_data["food_name"]
-    kcal = context.user_data["food_kcal"]
-    uid  = update.effective_user.id
+    name  = context.user_data["food_name"]
+    kcal  = context.user_data["food_kcal"]
+    uid   = update.effective_user.id
+    badge = _kcal_badge(kcal)
 
     db_add_entry(uid, name, kcal)
 
@@ -538,12 +590,12 @@ async def _save_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     )
 
     msg = (
-        f"✅ *{name}* — {kcal} ккал добавлено!\n\n"
+        f"✅ {badge} *{name}* — {kcal} ккал добавлено!\n\n"
         f"{bar}\n"
         f"Сегодня: *{total}* / {goal} ккал\n"
     )
     msg += (
-        f"📉 Дефицит пока: *{remaining}* ккал"
+        f"📉 Ещё можно: *{remaining}* ккал"
         if remaining > 0 else
         f"⚠️ Превышение нормы на *{abs(remaining)}* ккал"
     )
@@ -581,12 +633,17 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     remaining = goal - total
     bar       = _progress_bar(total, goal)
 
-    lines = [f"📊 *Сводка за {today}*\n", bar, f"*{total}* / {goal} ккал\n"]
-    lines.append("─" * 28)
+    lines = [f"📊 *Сводка за {today}*\n"]
+    lines.append(bar)
+    lines.append(f"*{total}* / {goal} ккал\n")
+    lines.append("─" * 26)
+
     for r in entries:
         time_str = r["logged_at"][11:16]
-        lines.append(f"  {time_str}  {r['name']} — {r['kcal']} ккал")
-    lines.append("─" * 28)
+        badge    = _kcal_badge(r["kcal"])
+        lines.append(f"  {badge} `{time_str}`  {r['name']} — *{r['kcal']}* ккал")
+
+    lines.append("─" * 26)
     lines.append(
         f"📉 Дефицит за день: *{remaining}* ккал"
         if remaining > 0 else
@@ -608,7 +665,6 @@ async def deficit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     logger.info("Дефицит запрошен: user_id=%d  goal=%d", uid, goal)
 
-    # Проверяем есть ли вообще данные
     all_rows = db_all_days(uid)
     if not all_rows:
         await update.message.reply_text(
@@ -618,7 +674,6 @@ async def deficit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Сегодня
     today_entries  = db_get_day(uid, today)
     today_consumed = sum(r["kcal"] for r in today_entries)
     today_deficit  = goal - today_consumed
@@ -684,10 +739,15 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"📅 *История за всё время ({len(rows)} дн.)*\n"]
     for r in rows:
         deficit_val = goal - r["total_kcal"]
-        status = f"✅ −{deficit_val}" if deficit_val > 0 else f"⚠️ +{abs(deficit_val)}"
+        if deficit_val > 0:
+            status   = f"✅ −{deficit_val}"
+            bar_mini = "🟩"
+        else:
+            status   = f"⚠️ +{abs(deficit_val)}"
+            bar_mini = "🟥"
         lines.append(
-            f"*{r['log_date']}*: {r['total_kcal']} ккал  "
-            f"{status} ккал  ({r['cnt']} зап.)"
+            f"{bar_mini} *{r['log_date']}*: {r['total_kcal']} ккал  "
+            f"{status} ккал  `{r['cnt']} зап.`"
         )
 
     for i, part in enumerate(_split_message(lines)):
@@ -816,7 +876,7 @@ def main() -> None:
     init_db()
 
     logger.info("━" * 60)
-    logger.info("  Calorie Bot  |  запуск  |  db=%s", DB_FILE)
+    logger.info("  🍏 Calorie Bot  |  запуск  |  db=%s", DB_FILE)
     logger.info("━" * 60)
 
     app = Application.builder().token(token).build()
