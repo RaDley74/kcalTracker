@@ -204,6 +204,18 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_food_log_user_date
                 ON food_log(user_id, log_date);
+
+            CREATE TABLE IF NOT EXISTS workout_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(user_id),
+                name       TEXT    NOT NULL,
+                kcal       INTEGER NOT NULL,
+                logged_at  TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
+                log_date   TEXT    NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_workout_log_user_date
+                ON workout_log(user_id, log_date);
         """)
     logger.info("База данных готова ✓")
 
@@ -330,6 +342,35 @@ def db_deficit_stats(user_id: int, since: str | None = None) -> dict:
     }
 
 
+def db_add_workout(user_id: int, name: str, kcal: int) -> None:
+    today = date.today().isoformat()
+    now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO workout_log(user_id, name, kcal, logged_at, log_date) VALUES(?,?,?,?,?)",
+            (user_id, name, kcal, now, today),
+        )
+    logger.info(
+        "Тренировка добавлена: user_id=%d  «%s» %d ккал  date=%s",
+        user_id, name, kcal, today,
+    )
+
+
+def db_get_workouts_day(user_id: int, day: str) -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT name, kcal, logged_at FROM workout_log "
+            "WHERE user_id=? AND log_date=? ORDER BY logged_at",
+            (user_id, day),
+        ).fetchall()
+
+
+def db_workout_kcal_day(user_id: int, day: str) -> int:
+    """Суммарные калории тренировок за день."""
+    rows = db_get_workouts_day(user_id, day)
+    return sum(r["kcal"] for r in rows)
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║                          Telegram bot                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -340,15 +381,21 @@ from telegram.ext import (
     ContextTypes, filters, ConversationHandler,
 )
 
-WAITING_FOOD, WAITING_CALORIES = range(2)
+(
+    WAITING_FOOD, WAITING_CALORIES,
+    WAITING_WORKOUT, WAITING_WORKOUT_KCAL,
+    TREADMILL_HR, TREADMILL_INCLINE, TREADMILL_SPEED,
+    TREADMILL_DURATION, TREADMILL_AGE, TREADMILL_WEIGHT,
+) = range(10)
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("➕ Добавить еду"),    KeyboardButton("📊 Сводка за день")],
-        [KeyboardButton("📉 Дефицит калорий"), KeyboardButton("📅 История")],
-        [KeyboardButton("🎯 Установить цель"), KeyboardButton("🗑 Очистить день")],
+        [KeyboardButton("➕ Добавить еду"),      KeyboardButton("🏋️ Добавить тренировку")],
+        [KeyboardButton("🏃 Беговая дорожка"),   KeyboardButton("📊 Сводка за день")],
+        [KeyboardButton("📉 Дефицит калорий"),   KeyboardButton("📅 История")],
+        [KeyboardButton("🎯 Установить цель"),   KeyboardButton("🗑 Очистить день")],
         [KeyboardButton("❓ Помощь")],
     ],
     resize_keyboard=True,
@@ -471,6 +518,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Я помогу отслеживать калории и считать дефицит.\n\n"
         "📌 *Команды:*\n"
         "/add — добавить приём пищи\n"
+        "/workout — добавить тренировку\n"
+        "/treadmill — калькулятор беговой дорожки\n"
         "/summary — сводка за сегодня\n"
         "/deficit — дефицит калорий\n"
         "/history — вся история\n"
@@ -490,9 +539,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "1\\. Нажми *➕ Добавить еду* или /add\n"
         "2\\. Введи название продукта\n"
         "3\\. Введи количество калорий\n\n"
-        "*Быстрый ввод:* пиши сразу `Овсянка 350`\n\n"
+        "*Быстрый ввод еды:* пиши сразу `Овсянка 350`\n\n"
+        "🏋️ Нажми *Добавить тренировку* или /workout\n"
+        "   Введи название и сожжённые калории\\.\n"
+        "   Тренировки вычитаются из суточного потребления\\.\n\n"
         "📉 Кнопка *Дефицит калорий* показывает:\n"
-        "  — дефицит за сегодня\n"
+        "  — дефицит за сегодня \\(с учётом тренировок\\)\n"
         "  — дефицит за 7 дней и за всё время\n"
         "  — прогноз похудения\n\n"
         "🎯 Установи цель через кнопку *Установить цель*\n\n"
@@ -580,19 +632,23 @@ async def _save_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     entries   = db_get_day(uid, _today())
     total     = sum(r["kcal"] for r in entries)
+    burned    = db_workout_kcal_day(uid, _today())
+    net       = total - burned
     goal      = db_get_goal(uid)
-    remaining = goal - total
-    bar       = _progress_bar(total, goal)
+    remaining = goal - net
+    bar       = _progress_bar(net, goal)
 
     logger.info(
-        "Итого за день: user_id=%d  total=%d  goal=%d  deficit=%d",
-        uid, total, goal, remaining,
+        "Итого за день: user_id=%d  total=%d  burned=%d  net=%d  goal=%d",
+        uid, total, burned, net, goal,
     )
 
     msg = (
         f"✅ {badge} *{name}* — {kcal} ккал добавлено!\n\n"
         f"{bar}\n"
-        f"Сегодня: *{total}* / {goal} ккал\n"
+        f"Съедено: *{total}* ккал"
+        + (f"  |  🔥 Сожжено: *{burned}* ккал" if burned else "") + "\n"
+        f"Чистые калории: *{net}* / {goal} ккал\n"
     )
     msg += (
         f"📉 Ещё можно: *{remaining}* ккал"
@@ -602,6 +658,316 @@ async def _save_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
+
+
+# ── Add workout ───────────────────────────────────────────────────────────────
+
+async def workout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _sync_user(update)
+    logger.debug("Начало добавления тренировки: user_id=%d", update.effective_user.id)
+    await update.message.reply_text(
+        "Введи название тренировки:\n"
+        "_(или сразу «Название Калории», например «Бег 300»)_",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD,
+    )
+    return WAITING_WORKOUT
+
+
+async def received_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    uid  = update.effective_user.id
+
+    if text == "❌ Отмена":
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+    parts = text.rsplit(" ", 1)
+    if len(parts) == 2:
+        try:
+            kcal = int(parts[1])
+            if kcal <= 0:
+                raise ValueError
+            context.user_data["workout_name"] = parts[0]
+            context.user_data["workout_kcal"] = kcal
+            return await _save_workout(update, context)
+        except ValueError:
+            pass
+
+    context.user_data["workout_name"] = text
+    await update.message.reply_text(
+        f"Сколько калорий сожжено в тренировке *{text}*?",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD,
+    )
+    return WAITING_WORKOUT_KCAL
+
+
+async def received_workout_kcal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    uid  = update.effective_user.id
+
+    if text == "❌ Отмена":
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+    try:
+        kcal = int(text)
+        if kcal <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Введи целое положительное число:")
+        return WAITING_WORKOUT_KCAL
+
+    context.user_data["workout_kcal"] = kcal
+    return await _save_workout(update, context)
+
+
+async def _save_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = context.user_data["workout_name"]
+    kcal = context.user_data["workout_kcal"]
+    uid  = update.effective_user.id
+
+    db_add_workout(uid, name, kcal)
+
+    today    = _today()
+    consumed = sum(r["kcal"] for r in db_get_day(uid, today))
+    burned   = db_workout_kcal_day(uid, today)
+    net      = consumed - burned
+    goal     = db_get_goal(uid)
+    remaining = goal - net
+    bar      = _progress_bar(net, goal)
+
+    logger.info(
+        "Тренировка сохранена: user_id=%d  «%s» %d ккал  net=%d",
+        uid, name, kcal, net,
+    )
+
+    msg = (
+        f"🏋️ *{name}* — сожжено *{kcal}* ккал!\n\n"
+        f"{bar}\n"
+        f"Съедено: *{consumed}* ккал  |  🔥 Сожжено: *{burned}* ккал\n"
+        f"Чистые калории: *{net}* / {goal} ккал\n"
+    )
+    msg += (
+        f"📉 Ещё можно: *{remaining}* ккал"
+        if remaining > 0 else
+        f"⚠️ Превышение нормы на *{abs(remaining)}* ккал"
+    )
+
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+# ── Treadmill calculator ──────────────────────────────────────────────────────
+
+def _calc_treadmill(
+    avg_hr: float,
+    incline: float,
+    speed_kmh: float,
+    duration_min: float,
+    age: int,
+    weight_kg: float,
+) -> dict:
+    """
+    Расчёт по методу ACSM + поправка на ЧСС.
+    Источник: calcCallOnThreadmill.py
+    """
+    speed_m_min   = speed_kmh * 1000 / 60
+    met_horizontal = 0.1 * speed_m_min
+    met_vertical   = 0.9 * (incline / 100) * speed_m_min
+    vo2            = met_horizontal + met_vertical + 3.5
+    MET            = vo2 / 3.5
+
+    hr_max   = max(220 - age, avg_hr + 1)
+    hr_ratio = avg_hr / hr_max
+    hr_factor = max(0.7, min(1.0 + 0.5 * (hr_ratio - 0.5), 1.35))
+
+    cal_per_min = (MET * 3.5 * weight_kg / 200) * hr_factor
+    total_kcal  = cal_per_min * duration_min
+    distance_km = speed_kmh * (duration_min / 60)
+
+    return {
+        "total_kcal":   round(total_kcal, 1),
+        "cal_per_min":  round(cal_per_min, 2),
+        "MET":          round(MET, 2),
+        "hr_factor":    round(hr_factor, 3),
+        "distance_km":  round(distance_km, 2),
+        "vo2":          round(vo2, 1),
+    }
+
+
+def _parse_positive_float(text: str, min_val: float, max_val: float):
+    """None если некорректно, иначе float."""
+    try:
+        val = float(text.replace(",", "."))
+        if min_val <= val <= max_val:
+            return val
+    except ValueError:
+        pass
+    return None
+
+
+async def treadmill_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _sync_user(update)
+    logger.debug("Калькулятор дорожки: user_id=%d", update.effective_user.id)
+    await update.message.reply_text(
+        "🏃 *Калькулятор беговой дорожки*\n\n"
+        "Введи среднюю *ЧСС* во время тренировки (уд/мин, 40–220):",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD,
+    )
+    return TREADMILL_HR
+
+
+async def _treadmill_cancel_check(update: Update) -> bool:
+    return update.message.text.strip() == "❌ Отмена"
+
+
+async def treadmill_hr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _treadmill_cancel_check(update):
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    val = _parse_positive_float(update.message.text, 40, 220)
+    if val is None:
+        await update.message.reply_text("⚠️ Введи число от 40 до 220:")
+        return TREADMILL_HR
+    context.user_data["tm_hr"] = val
+    await update.message.reply_text("Уклон дорожки (%, 0–30):", reply_markup=CANCEL_KEYBOARD)
+    return TREADMILL_INCLINE
+
+
+async def treadmill_incline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _treadmill_cancel_check(update):
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    val = _parse_positive_float(update.message.text, 0, 30)
+    if val is None:
+        await update.message.reply_text("⚠️ Введи число от 0 до 30:")
+        return TREADMILL_INCLINE
+    context.user_data["tm_incline"] = val
+    await update.message.reply_text("Средняя скорость (км/ч, 1–30):", reply_markup=CANCEL_KEYBOARD)
+    return TREADMILL_SPEED
+
+
+async def treadmill_speed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _treadmill_cancel_check(update):
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    val = _parse_positive_float(update.message.text, 1, 30)
+    if val is None:
+        await update.message.reply_text("⚠️ Введи число от 1 до 30:")
+        return TREADMILL_SPEED
+    context.user_data["tm_speed"] = val
+    await update.message.reply_text("Время тренировки (мин, 1–300):", reply_markup=CANCEL_KEYBOARD)
+    return TREADMILL_DURATION
+
+
+async def treadmill_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _treadmill_cancel_check(update):
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    val = _parse_positive_float(update.message.text, 1, 300)
+    if val is None:
+        await update.message.reply_text("⚠️ Введи число от 1 до 300:")
+        return TREADMILL_DURATION
+    context.user_data["tm_duration"] = val
+    await update.message.reply_text("Твой возраст (лет, 10–100):", reply_markup=CANCEL_KEYBOARD)
+    return TREADMILL_AGE
+
+
+async def treadmill_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _treadmill_cancel_check(update):
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    val = _parse_positive_float(update.message.text, 10, 100)
+    if val is None:
+        await update.message.reply_text("⚠️ Введи число от 10 до 100:")
+        return TREADMILL_AGE
+    context.user_data["tm_age"] = int(val)
+    await update.message.reply_text("Масса тела (кг, 30–250):", reply_markup=CANCEL_KEYBOARD)
+    return TREADMILL_WEIGHT
+
+
+async def treadmill_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _treadmill_cancel_check(update):
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    val = _parse_positive_float(update.message.text, 30, 250)
+    if val is None:
+        await update.message.reply_text("⚠️ Введи число от 30 до 250:")
+        return TREADMILL_WEIGHT
+    context.user_data["tm_weight"] = val
+
+    ud  = context.user_data
+    res = _calc_treadmill(
+        avg_hr      = ud["tm_hr"],
+        incline     = ud["tm_incline"],
+        speed_kmh   = ud["tm_speed"],
+        duration_min= ud["tm_duration"],
+        age         = ud["tm_age"],
+        weight_kg   = ud["tm_weight"],
+    )
+    uid = update.effective_user.id
+    logger.info(
+        "Калькулятор дорожки: user_id=%d  kcal=%.1f  dist=%.2f km",
+        uid, res["total_kcal"], res["distance_km"],
+    )
+
+    # Предложение добавить как тренировку
+    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+    add_btn = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"➕ Добавить {res['total_kcal']} ккал как тренировку",
+            callback_data=f"tm_add:{res['total_kcal']}:Беговая дорожка",
+        )
+    ]])
+
+    msg = (
+        "🏃 *Результат расчёта*\n\n"
+        f"🛣 Дистанция:        *{res['distance_km']} км*\n"
+        f"💧 VO₂:             *{res['vo2']} мл/кг/мин*\n"
+        f"⚡ MET:             *{res['MET']}*\n"
+        f"❤️ ЧСС-коэффициент: *{res['hr_factor']}*\n"
+        f"🔥 Калорий/мин:     *{res['cal_per_min']} ккал/мин*\n"
+        "─────────────────────────\n"
+        f"✅ *Итого сожжено: {res['total_kcal']} ккал*"
+    )
+    await update.message.reply_text(
+        msg, parse_mode="Markdown",
+        reply_markup=add_btn,
+    )
+    return ConversationHandler.END
+
+
+async def treadmill_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline-кнопка «Добавить как тренировку»."""
+    query = update.callback_query
+    await query.answer()
+    _, kcal_str, name = query.data.split(":", 2)
+    kcal = round(float(kcal_str))
+    uid  = query.from_user.id
+    db_ensure_user(uid, query.from_user.username, query.from_user.full_name)
+    db_add_workout(uid, name, kcal)
+
+    today    = _today()
+    consumed = sum(r["kcal"] for r in db_get_day(uid, today))
+    burned   = db_workout_kcal_day(uid, today)
+    net      = consumed - burned
+    goal     = db_get_goal(uid)
+    remaining = goal - net
+    bar      = _progress_bar(net, goal)
+
+    logger.info("Тренировка с дорожки добавлена: user_id=%d  %d ккал", uid, kcal)
+
+    await query.edit_message_text(
+        f"✅ *{name}* — {kcal} ккал добавлено в тренировки!\n\n"
+        f"{bar}\n"
+        f"Чистые калории: *{net}* / {goal} ккал\n"
+        + (f"📉 Ещё можно: *{remaining}* ккал" if remaining > 0
+           else f"⚠️ Превышение нормы на *{abs(remaining)}* ккал"),
+        parse_mode="Markdown",
+    )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -630,20 +996,33 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     total     = sum(r["kcal"] for r in entries)
-    remaining = goal - total
-    bar       = _progress_bar(total, goal)
+    burned    = db_workout_kcal_day(uid, today)
+    net       = total - burned
+    remaining = goal - net
+    bar       = _progress_bar(net, goal)
 
     lines = [f"📊 *Сводка за {today}*\n"]
     lines.append(bar)
-    lines.append(f"*{total}* / {goal} ккал\n")
+    lines.append(f"*{net}* / {goal} ккал (чистые)\n")
     lines.append("─" * 26)
+    lines.append("🍽 *Еда:*")
 
     for r in entries:
         time_str = r["logged_at"][11:16]
         badge    = _kcal_badge(r["kcal"])
         lines.append(f"  {badge} `{time_str}`  {r['name']} — *{r['kcal']}* ккал")
 
+    workout_rows = db_get_workouts_day(uid, today)
+    if workout_rows:
+        lines.append("─" * 26)
+        lines.append("🏋️ *Тренировки:*")
+        for r in workout_rows:
+            time_str = r["logged_at"][11:16]
+            lines.append(f"  🔥 `{time_str}`  {r['name']} — −*{r['kcal']}* ккал")
+        lines.append(f"  Итого сожжено: *{burned}* ккал")
+
     lines.append("─" * 26)
+    lines.append(f"🍽 Съедено: *{total}* ккал  |  🔥 Сожжено: *{burned}* ккал")
     lines.append(
         f"📉 Дефицит за день: *{remaining}* ккал"
         if remaining > 0 else
@@ -676,20 +1055,25 @@ async def deficit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     today_entries  = db_get_day(uid, today)
     today_consumed = sum(r["kcal"] for r in today_entries)
-    today_deficit  = goal - today_consumed
+    today_burned   = db_workout_kcal_day(uid, today)
+    today_net      = today_consumed - today_burned
+    today_deficit  = goal - today_net
 
     if today_entries:
-        bar = _progress_bar(today_consumed, goal)
+        bar = _progress_bar(today_net, goal)
+        burned_line = f"  🔥 Сожжено: *{today_burned}* ккал\n" if today_burned else ""
         if today_deficit >= 0:
             today_block = (
-                f"📉 *Сегодня* ({today_consumed} / {goal} ккал)\n"
+                f"📉 *Сегодня* ({today_net} / {goal} ккал)\n"
                 f"{bar}\n"
+                f"{burned_line}"
                 f"Дефицит: *{today_deficit}* ккал  ≈  *{today_deficit / KCAL_PER_KG:.3f}* кг"
             )
         else:
             today_block = (
-                f"⚠️ *Сегодня* ({today_consumed} / {goal} ккал)\n"
-                f"{_progress_bar(today_consumed, goal)}\n"
+                f"⚠️ *Сегодня* ({today_net} / {goal} ккал)\n"
+                f"{_progress_bar(today_net, goal)}\n"
+                f"{burned_line}"
                 f"Профицит: *{abs(today_deficit)}* ккал"
             )
     else:
@@ -836,19 +1220,23 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     logger.debug("Текстовое сообщение: user_id=%d  «%s»", uid, text[:60])
 
     routes = {
-        "➕ Добавить еду":    add_start,
-        "📊 Сводка за день":  summary,
-        "📉 Дефицит калорий": deficit,
-        "📅 История":         history,
-        "🎯 Установить цель": set_goal_start,
-        "🗑 Очистить день":   clear_day,
-        "❓ Помощь":          help_cmd,
+        "➕ Добавить еду":        add_start,
+        "🏋️ Добавить тренировку": workout_start,
+        "🏃 Беговая дорожка":     treadmill_start,
+        "📊 Сводка за день":      summary,
+        "📉 Дефицит калорий":     deficit,
+        "📅 История":             history,
+        "🎯 Установить цель":     set_goal_start,
+        "🗑 Очистить день":       clear_day,
+        "❓ Помощь":              help_cmd,
     }
 
     handler = routes.get(text)
     if handler:
         if handler is add_start:
             context.user_data["_conv_state"] = WAITING_FOOD
+        if handler is workout_start:
+            context.user_data["_conv_state"] = WAITING_WORKOUT
         await handler(update, context)
     else:
         await update.message.reply_text(
@@ -893,14 +1281,47 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("help",    help_cmd))
-    app.add_handler(CommandHandler("summary", summary))
-    app.add_handler(CommandHandler("deficit", deficit))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CommandHandler("goal",    set_goal))
-    app.add_handler(CommandHandler("clear",   clear_day))
+    workout_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("workout", workout_start),
+            MessageHandler(filters.Regex("^🏋️ Добавить тренировку$"), workout_start),
+        ],
+        states={
+            WAITING_WORKOUT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, received_workout)],
+            WAITING_WORKOUT_KCAL:[MessageHandler(filters.TEXT & ~filters.COMMAND, received_workout_kcal)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    from telegram.ext import CallbackQueryHandler
+
+    treadmill_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("treadmill", treadmill_start),
+            MessageHandler(filters.Regex("^🏃 Беговая дорожка$"), treadmill_start),
+        ],
+        states={
+            TREADMILL_HR:       [MessageHandler(filters.TEXT & ~filters.COMMAND, treadmill_hr)],
+            TREADMILL_INCLINE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, treadmill_incline)],
+            TREADMILL_SPEED:    [MessageHandler(filters.TEXT & ~filters.COMMAND, treadmill_speed)],
+            TREADMILL_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, treadmill_duration)],
+            TREADMILL_AGE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, treadmill_age)],
+            TREADMILL_WEIGHT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, treadmill_weight)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("help",       help_cmd))
+    app.add_handler(CommandHandler("summary",    summary))
+    app.add_handler(CommandHandler("deficit",    deficit))
+    app.add_handler(CommandHandler("history",    history))
+    app.add_handler(CommandHandler("goal",       set_goal))
+    app.add_handler(CommandHandler("clear",      clear_day))
     app.add_handler(conv)
+    app.add_handler(workout_conv)
+    app.add_handler(treadmill_conv)
+    app.add_handler(CallbackQueryHandler(treadmill_add_callback, pattern=r"^tm_add:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
 
