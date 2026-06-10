@@ -301,7 +301,9 @@ def db_all_days(user_id: int) -> list[tuple]:
 
 
 def db_deficit_stats(user_id: int, since: str | None = None) -> dict:
-    """Статистика дефицита с опциональным фильтром по дате."""
+    """Статистика дефицита с опциональным фильтром по дате.
+    Учитывает сожжённые калории тренировок: дефицит = цель − (еда − тренировки).
+    """
     goal = db_get_goal(user_id)
     params: list = [user_id]
     where = "WHERE user_id=?"
@@ -310,22 +312,35 @@ def db_deficit_stats(user_id: int, since: str | None = None) -> dict:
         params.append(since)
 
     with get_conn() as conn:
-        rows = conn.execute(
+        # Калории из еды по дням
+        food_rows = conn.execute(
             f"""SELECT log_date, SUM(kcal) AS total
                 FROM food_log {where}
                 GROUP BY log_date""",
             params,
         ).fetchall()
 
-    if not rows:
+        # Калории тренировок по дням
+        workout_rows = conn.execute(
+            f"""SELECT log_date, SUM(kcal) AS total
+                FROM workout_log {where}
+                GROUP BY log_date""",
+            params,
+        ).fetchall()
+
+    if not food_rows:
         return {"total_deficit": 0, "avg_deficit": 0,
                 "tracked_days": 0, "days_deficit": 0, "days_surplus": 0}
+
+    workout_map = {r["log_date"]: r["total"] for r in workout_rows}
 
     total_deficit = 0
     days_deficit  = 0
     days_surplus  = 0
-    for row in rows:
-        diff = goal - row["total"]
+    for row in food_rows:
+        burned = workout_map.get(row["log_date"], 0)
+        net    = row["total"] - burned          # чистые калории за день
+        diff   = goal - net                     # дефицит (+) / профицит (−)
         total_deficit += diff
         if diff > 0:
             days_deficit += 1
