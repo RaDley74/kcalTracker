@@ -265,6 +265,25 @@ def db_add_entry(user_id: int, name: str, kcal: int) -> None:
     )
 
 
+def db_recent_food(user_id: int, limit: int = 15) -> list[sqlite3.Row]:
+    """Последние уникальные продукты пользователя (по имени, самые свежие)."""
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT name, kcal
+               FROM (
+                   SELECT name, kcal,
+                          ROW_NUMBER() OVER (PARTITION BY name ORDER BY logged_at DESC) AS rn
+                   FROM food_log
+                   WHERE user_id = ?
+               )
+               WHERE rn = 1
+               ORDER BY (SELECT MAX(logged_at) FROM food_log
+                         WHERE user_id = ? AND name = food_log.name) DESC
+               LIMIT ?""",
+            (user_id, user_id, limit),
+        ).fetchall()
+
+
 def db_get_day(user_id: int, day: str) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
@@ -572,15 +591,40 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Add food ──────────────────────────────────────────────────────────────────
 
+def _build_food_keyboard(uid: int) -> ReplyKeyboardMarkup:
+    """Клавиатура с последними 15 уникальными продуктами + кнопка отмены."""
+    recent = db_recent_food(uid, limit=15)
+    rows = []
+    for i in range(0, len(recent), 2):
+        pair = []
+        for r in recent[i:i+2]:
+            pair.append(KeyboardButton(f"\U0001f4cc {r['name']} \u2022 {r['kcal']} ккал"))
+        rows.append(pair)
+    rows.append([KeyboardButton("\u274c Отмена")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _sync_user(update)
-    logger.debug("Начало добавления еды: user_id=%d", update.effective_user.id)
-    await update.message.reply_text(
-        "Введи название продукта или блюда:\n"
-        "_(или сразу «Название Калории», например «Гречка 280»)_",
-        parse_mode="Markdown",
-        reply_markup=CANCEL_KEYBOARD,
-    )
+    uid = update.effective_user.id
+    logger.debug("Начало добавления еды: user_id=%d", uid)
+
+    recent = db_recent_food(uid, limit=15)
+    if recent:
+        keyboard = _build_food_keyboard(uid)
+        hint = (
+            "Введи название продукта или блюда:\n"
+            "_(или сразу «Название Калории», например «Гречка 280»)_\n\n"
+            "\u2b07\ufe0f Или выбери из недавних:"
+        )
+    else:
+        keyboard = CANCEL_KEYBOARD
+        hint = (
+            "Введи название продукта или блюда:\n"
+            "_(или сразу «Название Калории», например «Гречка 280»)_"
+        )
+
+    await update.message.reply_text(hint, parse_mode="Markdown", reply_markup=keyboard)
     return WAITING_FOOD
 
 
@@ -593,6 +637,18 @@ async def received_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
+    # Кнопка из истории: "📌 Название • 350 ккал"
+    import re
+    history_match = re.match(r"^📌 (.+) • (\d+) ккал$", text)
+    if history_match:
+        food_name = history_match.group(1)
+        kcal      = int(history_match.group(2))
+        context.user_data["food_name"] = food_name
+        context.user_data["food_kcal"] = kcal
+        logger.debug("Быстрый выбор из истории: user_id=%d «%s» %d ккал", uid, food_name, kcal)
+        return await _save_entry(update, context)
+
+    # Быстрый ввод: "Гречка 280"
     parts = text.rsplit(" ", 1)
     if len(parts) == 2:
         try:
