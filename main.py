@@ -3,6 +3,10 @@ import sys
 import sqlite3
 import logging
 import textwrap
+import base64
+import json
+import urllib.request
+import urllib.error
 from datetime import datetime, date, timedelta
 from logging.handlers import RotatingFileHandler
 
@@ -18,6 +22,9 @@ def _ensure_env() -> None:
         with open(ENV_FILE, "w", encoding="utf-8") as f:
             f.write("# Вставь токен от @BotFather\n")
             f.write("BOT_TOKEN=\n")
+            f.write("\n# Ключ OpenRouter для анализа фото еды (бесплатно)\n")
+            f.write("# Получи на https://openrouter.ai/keys\n")
+            f.write("OPENROUTER_API_KEY=\n")
         print(
             "\n┌─ ПЕРВЫЙ ЗАПУСК ──────────────────────────────┐\n"
             f"│  Файл {ENV_FILE} создан.                         │\n"
@@ -420,17 +427,18 @@ from telegram.ext import (
     WAITING_WORKOUT, WAITING_WORKOUT_KCAL,
     TREADMILL_HR, TREADMILL_INCLINE, TREADMILL_SPEED,
     TREADMILL_DURATION, TREADMILL_AGE, TREADMILL_WEIGHT,
-) = range(10)
+    PHOTO_CONFIRM_KCAL, PHOTO_CAPTION,
+) = range(12)
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("➕ Добавить еду"),      KeyboardButton("🏋️ Добавить тренировку")],
-        [KeyboardButton("🏃 Беговая дорожка"),   KeyboardButton("📊 Сводка за день")],
-        [KeyboardButton("📉 Дефицит калорий"),   KeyboardButton("📅 История")],
-        [KeyboardButton("🎯 Установить цель"),   KeyboardButton("🗑 Очистить день")],
-        [KeyboardButton("❓ Помощь")],
+        [KeyboardButton("📷 Фото еды → калории"), KeyboardButton("🏃 Беговая дорожка")],
+        [KeyboardButton("📊 Сводка за день"),     KeyboardButton("📉 Дефицит калорий")],
+        [KeyboardButton("📅 История"),            KeyboardButton("🎯 Установить цель")],
+        [KeyboardButton("🗑 Очистить день"),      KeyboardButton("❓ Помощь")],
     ],
     resize_keyboard=True,
 )
@@ -552,6 +560,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Я помогу отслеживать калории и считать дефицит.\n\n"
         "📌 *Команды:*\n"
         "/add — добавить приём пищи\n"
+        "/photo — 📷 сфоткай еду, я сам посчитаю калории\n"
         "/workout — добавить тренировку\n"
         "/treadmill — калькулятор беговой дорожки\n"
         "/summary — сводка за сегодня\n"
@@ -1291,15 +1300,16 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     logger.debug("Текстовое сообщение: user_id=%d  «%s»", uid, text[:60])
 
     routes = {
-        "➕ Добавить еду":        add_start,
-        "🏋️ Добавить тренировку": workout_start,
-        "🏃 Беговая дорожка":     treadmill_start,
-        "📊 Сводка за день":      summary,
-        "📉 Дефицит калорий":     deficit,
-        "📅 История":             history,
-        "🎯 Установить цель":     set_goal_start,
-        "🗑 Очистить день":       clear_day,
-        "❓ Помощь":              help_cmd,
+        "➕ Добавить еду":          add_start,
+        "🏋️ Добавить тренировку":  workout_start,
+        "📷 Фото еды → калории":   photo_start,
+        "🏃 Беговая дорожка":      treadmill_start,
+        "📊 Сводка за день":       summary,
+        "📉 Дефицит калорий":      deficit,
+        "📅 История":              history,
+        "🎯 Установить цель":      set_goal_start,
+        "🗑 Очистить день":        clear_day,
+        "❓ Помощь":               help_cmd,
     }
 
     handler = routes.get(text)
@@ -1320,6 +1330,298 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ║                          Entry point                                        ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                     Photo → Calories  (OpenRouter / Gemini Flash free)      ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"   # бесплатная vision-модель
+
+PHOTO_SYSTEM = (
+    "Ты диетолог-нутрициолог. Пользователь присылает фото еды.\n\n"
+    "ПРАВИЛА (соблюдай строго):\n"
+    "1. Если пользователь указал состав блюда — используй ТОЛЬКО его данные как источник правды о составе. "
+    "Фото служит лишь для оценки размера порции, но НЕ для определения состава. "
+    "Никогда не заменяй и не переименовывай продукты, названные пользователем, на то, что ты видишь на фото.\n"
+    "2. Если состав не указан — определи блюдо по фото самостоятельно.\n"
+    "3. Рассчитай калории максимально точно исходя из граммовки. "
+    "Если вес не указан — оцени по фото.\n"
+    "4. Отвечай ТОЛЬКО валидным JSON-объектом (не массивом) без markdown-обёрток:\n"
+    '{"name": "<название на русском строго по составу пользователя>", '
+    '"kcal": <целое число — сумма калорий всех компонентов>, '
+    '"note": "<расчёт: продукт (вес, ккал) + продукт (вес, ккал) = итого>"}'
+)
+
+
+def _analyze_photo_openrouter(image_bytes: bytes, mime: str = "image/jpeg", extra_info: str = "") -> dict | None:
+    """Отправляет фото в OpenRouter и возвращает dict {name, kcal, note} или None."""
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        logger.warning("OPENROUTER_API_KEY не задан, анализ фото пропущен")
+        return None
+
+    b64 = base64.b64encode(image_bytes).decode()
+
+    user_text = "Определи блюда на фото и оцени калории."
+    if extra_info:
+        user_text += (
+            f"\n\n⚠️ СОСТАВ УКАЗАН ПОЛЬЗОВАТЕЛЕМ (высший приоритет, не игнорировать): {extra_info}\n"
+            "Используй ИМЕННО эти продукты для названия и расчёта калорий. "
+            "Фото — только для оценки размера порции если вес не указан."
+        )
+
+    payload = json.dumps({
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": PHOTO_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    },
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ],
+        "max_tokens": 300,
+    }).encode()
+
+    req = urllib.request.Request(
+        OPENROUTER_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://github.com/calorie-bot",
+            "X-Title": "Calorie Telegram Bot",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        logger.error("OpenRouter HTTP %d: %s", e.code, body)
+        return None
+    except Exception as exc:
+        logger.error("OpenRouter error: %s", exc)
+        return None
+
+    try:
+        content = data["choices"][0]["message"]["content"].strip()
+        # Убираем возможные ```json ... ``` обёртки
+        content = content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(content)
+
+        # Модель может вернуть список блюд или один объект
+        if isinstance(parsed, list):
+            if not parsed:
+                raise ValueError("Пустой список блюд")
+            if len(parsed) == 1:
+                result = parsed[0]
+            else:
+                # Несколько блюд — суммируем калории, объединяем названия
+                total_kcal = sum(int(item.get("kcal", 0)) for item in parsed)
+                names      = ", ".join(item.get("name", "?") for item in parsed)
+                notes      = "; ".join(item.get("note", "") for item in parsed if item.get("note"))
+                result     = {"name": names, "kcal": total_kcal, "note": notes}
+        else:
+            result = parsed
+
+        result["kcal"] = int(result["kcal"])
+        return result
+    except Exception as exc:
+        logger.error("Не удалось разобрать ответ OpenRouter: %s | raw: %s", exc, data)
+        return None
+
+
+# ── Photo handlers ─────────────────────────────────────────────────────────────
+
+async def photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Просим пользователя прислать фото."""
+    _sync_user(update)
+    uid = update.effective_user.id
+
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        await update.message.reply_text(
+            "⚠️ Функция анализа фото не настроена.\n\n"
+            "Добавь в файл `.env`:\n"
+            "`OPENROUTER_API_KEY=sk-or-...`\n\n"
+            "Бесплатный ключ: https://openrouter.ai/keys",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    logger.debug("Начало анализа фото: user_id=%d", uid)
+    await update.message.reply_text(
+        "📷 *Пришли фото блюда* — я определю состав и оценю калории.\n\n"
+        "_Лучшее качество: вид сверху, хорошее освещение, порция целиком._",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD,
+    )
+    return PHOTO_CAPTION
+
+
+async def photo_got_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получили фото — сохраняем и спрашиваем уточнение состава."""
+    uid = update.effective_user.id
+
+    if not update.message.photo:
+        await update.message.reply_text(
+            "Пожалуйста, пришли именно *фото* (не файл).",
+            parse_mode="Markdown",
+        )
+        return PHOTO_CAPTION
+
+    # Сохраняем file_id — скачаем позже, после уточнения
+    context.user_data["photo_file_id"] = update.message.photo[-1].file_id
+    # Если пользователь прислал подпись прямо к фото — сразу используем
+    caption = (update.message.caption or "").strip()
+    if caption:
+        context.user_data["photo_extra"] = caption
+
+    skip_keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("➡️ Пропустить — анализируй без уточнений")],
+         [KeyboardButton("❌ Отмена")]],
+        resize_keyboard=True,
+    )
+    await update.message.reply_text(
+        "✍️ *Можешь уточнить состав блюда* — это повысит точность оценки.\n\n"
+        "Например: _«гречка 200г, куриная грудка 150г, масло 1 ч.л.»_\n\n"
+        "Или нажми *Пропустить*, если хочешь чтобы бот определил сам.",
+        parse_mode="Markdown",
+        reply_markup=skip_keyboard,
+    )
+    return PHOTO_CONFIRM_KCAL
+
+
+async def photo_got_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получили уточнение состава (или пропуск) — или обрабатываем подтверждение после анализа."""
+    uid  = update.effective_user.id
+    text = update.message.text.strip()
+
+    if text == "❌ Отмена":
+        context.user_data.clear()
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+    # ── После анализа: подтверждение / ручной ввод ────────────────────────────
+    if context.user_data.get("_photo_analyzed"):
+
+        if text.startswith("✅ Сохранить"):
+            name = context.user_data.get("photo_name", "Блюдо с фото")
+            kcal = context.user_data.get("photo_kcal", 0)
+            db_add_entry(uid, name, kcal)
+            badge = _kcal_badge(kcal)
+            logger.info("Фото-запись сохранена: user_id=%d «%s» %d ккал", uid, name, kcal)
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"✅ Записано: {badge} *{name}* — *{kcal}* ккал",
+                parse_mode="Markdown",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return ConversationHandler.END
+
+        if text == "✏️ Указать калории вручную":
+            name = context.user_data.get("photo_name", "Блюдо с фото")
+            context.user_data["_photo_manual"] = True
+            await update.message.reply_text(
+                f"Сколько калорий в *{name}*?",
+                parse_mode="Markdown",
+                reply_markup=CANCEL_KEYBOARD,
+            )
+            return PHOTO_CONFIRM_KCAL
+
+        if context.user_data.get("_photo_manual"):
+            try:
+                kcal = int(text)
+                if kcal <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("⚠️ Введи целое положительное число:")
+                return PHOTO_CONFIRM_KCAL
+            name = context.user_data.get("photo_name", "Блюдо с фото")
+            db_add_entry(uid, name, kcal)
+            badge = _kcal_badge(kcal)
+            logger.info("Фото-запись (ручная) сохранена: user_id=%d «%s» %d ккал", uid, name, kcal)
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"✅ Записано: {badge} *{name}* — *{kcal}* ккал",
+                parse_mode="Markdown",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return ConversationHandler.END
+
+        await update.message.reply_text("Используй кнопки выше.")
+        return PHOTO_CONFIRM_KCAL
+
+    # ── Первый вызов: уточнение состава → запускаем анализ ────────────────────
+    if text != "➡️ Пропустить — анализируй без уточнений":
+        context.user_data["photo_extra"] = text
+
+    extra   = context.user_data.get("photo_extra", "")
+    file_id = context.user_data.get("photo_file_id")
+
+    if not file_id:
+        await update.message.reply_text("Что-то пошло не так, пришли фото заново.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+    if extra:
+        await update.message.reply_text(f"🔍 Анализирую с учётом: _{extra}_…", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("🔍 Анализирую фото, подожди секунду…")
+
+    photo_file  = await context.bot.get_file(file_id)
+    image_bytes = await photo_file.download_as_bytearray()
+
+    result = _analyze_photo_openrouter(bytes(image_bytes), extra_info=extra)
+
+    if result is None:
+        await update.message.reply_text(
+            "😔 Не удалось проанализировать фото. Попробуй позже или добавь еду вручную.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    name = result.get("name", "Блюдо с фото")
+    kcal = result.get("kcal", 0)
+    note = result.get("note", "")
+
+    context.user_data["photo_name"]     = name
+    context.user_data["photo_kcal"]     = kcal
+    context.user_data["_photo_analyzed"] = True
+
+    badge = _kcal_badge(kcal)
+    confirm_keyboard = ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(f"✅ Сохранить {kcal} ккал")],
+            [KeyboardButton("✏️ Указать калории вручную")],
+            [KeyboardButton("❌ Отмена")],
+        ],
+        resize_keyboard=True,
+    )
+    extra_line = f"\n📝 _Учтено: {extra}_\n" if extra else ""
+    await update.message.reply_text(
+        f"🍽 *{name}*\n"
+        f"{badge} Оценка: *{kcal} ккал*\n"
+        f"{extra_line}\n"
+        f"💬 _{note}_\n\n"
+        "Сохранить эту запись?",
+        parse_mode="Markdown",
+        reply_markup=confirm_keyboard,
+    )
+    return PHOTO_CONFIRM_KCAL
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                          Entry point                                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
 def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
@@ -1331,6 +1633,13 @@ def main() -> None:
             "└──────────────────────────────────────────────┘\n"
         )
         raise SystemExit(1)
+
+    or_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not or_key:
+        logger.warning(
+            "OPENROUTER_API_KEY не задан — анализ фото еды будет недоступен. "
+            "Получи бесплатный ключ на https://openrouter.ai/keys и добавь в %s", ENV_FILE
+        )
 
     init_db()
 
@@ -1389,9 +1698,29 @@ def main() -> None:
     app.add_handler(CommandHandler("history",    history))
     app.add_handler(CommandHandler("goal",       set_goal))
     app.add_handler(CommandHandler("clear",      clear_day))
+
+    photo_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("photo", photo_start),
+            MessageHandler(filters.Regex("^📷 Фото еды → калории$"), photo_start),
+        ],
+        states={
+            # Ждём фото (с необязательной подписью)
+            PHOTO_CAPTION: [
+                MessageHandler(filters.PHOTO, photo_got_image),
+            ],
+            # Ждём уточнение состава → потом подтверждение/сохранение
+            PHOTO_CONFIRM_KCAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, photo_got_caption),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(conv)
     app.add_handler(workout_conv)
     app.add_handler(treadmill_conv)
+    app.add_handler(photo_conv)
     app.add_handler(CallbackQueryHandler(treadmill_add_callback, pattern=r"^tm_add:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
