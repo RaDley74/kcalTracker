@@ -5,6 +5,7 @@ import logging
 import textwrap
 import base64
 import json
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, date, timedelta
@@ -136,9 +137,9 @@ def _setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # ── Консоль (INFO+) ──────────────────────────────────────────────────────
+    # ── Консоль (DEBUG+) — полный лог всех действий ─────────────────────────
     console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.INFO)
+    console.setLevel(logging.DEBUG)
     console.setFormatter(_ConsoleFormatter())
     root.addHandler(console)
 
@@ -171,6 +172,34 @@ def _setup_logging() -> None:
 
 _setup_logging()
 logger = logging.getLogger("calorie_bot")
+
+
+# ── Logging helpers ───────────────────────────────────────────────────────────
+
+def _log_user_msg(update, extra: str = "") -> None:
+    """Логирует входящее сообщение пользователя."""
+    u    = update.effective_user
+    text = ""
+    if update.message:
+        if update.message.text:
+            text = f"«{update.message.text[:80]}»"
+        elif update.message.photo:
+            text = "[фото]"
+        elif update.message.document:
+            text = f"[файл: {update.message.document.file_name}]"
+        else:
+            text = "[медиа]"
+    name = u.full_name or u.username or str(u.id)
+    suffix = f"  {extra}" if extra else ""
+    logger.debug("→ USER  id=%-12s %-18s %s%s", u.id, name, text, suffix)
+
+
+def _log_bot_reply(uid, text: str, extra: str = "") -> None:
+    """Логирует исходящий ответ бота (первые 120 символов)."""
+    preview = text.replace("\n", " ").strip()[:120]
+    suffix  = f"  [{extra}]" if extra else ""
+    logger.debug("← BOT   id=%-12s «%s»%s", uid, preview, suffix)
+
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║                          SQLite  database                                   ║
@@ -554,7 +583,14 @@ def _split_message(lines: list[str], limit: int = 3800) -> list[list[str]]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _sync_user(update)
     u = update.effective_user
+    _log_user_msg(update, extra="/start")
     logger.info("Команда /start: user_id=%d (%s)", u.id, u.full_name)
+    _msg = (
+        f"Привет, *{u.first_name}*! 👋\n\n"
+        "Я помогу отслеживать калории и считать дефицит.\n\n"
+        "📌 *Команды:*\n/add, /photo, /workout, /treadmill, /summary, /deficit, /history, /goal, /clear"
+    )
+    _log_bot_reply(u.id, _msg, extra="start-welcome")
     await update.message.reply_text(
         f"Привет, *{u.first_name}*! 👋\n\n"
         "Я помогу отслеживать калории и считать дефицит.\n\n"
@@ -576,7 +612,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _sync_user(update)
+    _log_user_msg(update, extra="/help")
     logger.debug("Команда /help: user_id=%d", update.effective_user.id)
+    _log_bot_reply(update.effective_user.id, "📖 Справка по командам бота", extra="help")
     await update.message.reply_text(
         "📖 *Как пользоваться ботом:*\n\n"
         "1\\. Нажми *➕ Добавить еду* или /add\n"
@@ -616,6 +654,7 @@ def _build_food_keyboard(uid: int) -> ReplyKeyboardMarkup:
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _sync_user(update)
     uid = update.effective_user.id
+    _log_user_msg(update, extra="➕ добавить еду — старт")
     logger.debug("Начало добавления еды: user_id=%d", uid)
 
     recent = db_recent_food(uid, limit=15)
@@ -643,6 +682,8 @@ async def received_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     if text == "❌ Отмена":
         logger.debug("Отмена добавления еды: user_id=%d", uid)
+        _log_user_msg(update, extra="отмена добавления еды")
+        _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
@@ -655,6 +696,7 @@ async def received_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         context.user_data["food_name"] = food_name
         context.user_data["food_kcal"] = kcal
         logger.debug("Быстрый выбор из истории: user_id=%d «%s» %d ккал", uid, food_name, kcal)
+        _log_user_msg(update, extra=f"выбор из истории: {food_name} {kcal} ккал")
         return await _save_entry(update, context)
 
     # Быстрый ввод: "Гречка 280"
@@ -667,6 +709,7 @@ async def received_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             context.user_data["food_name"] = parts[0]
             context.user_data["food_kcal"] = kcal
             logger.debug("Быстрый ввод: user_id=%d «%s» %d ккал", uid, parts[0], kcal)
+            _log_user_msg(update, extra=f"быстрый ввод: {parts[0]} {kcal} ккал")
             return await _save_entry(update, context)
         except ValueError:
             pass
@@ -695,6 +738,8 @@ async def received_calories(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             raise ValueError
     except ValueError:
         logger.warning("Некорректные калории от user_id=%d: «%s»", uid, text)
+        _log_user_msg(update, extra=f"некорректные калории: {text!r}")
+        _log_bot_reply(uid, "⚠️ Введи целое положительное число:", extra="validation-error")
         await update.message.reply_text("⚠️ Введи целое положительное число:")
         return WAITING_CALORIES
 
@@ -722,6 +767,7 @@ async def _save_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         "Итого за день: user_id=%d  total=%d  burned=%d  net=%d  goal=%d",
         uid, total, burned, net, goal,
     )
+    _log_bot_reply(uid, f"✅ {name} — {kcal} ккал добавлено | итого={total} сожжено={burned} net={net}/{goal}", extra="food-saved")
 
     msg = (
         f"✅ {badge} *{name}* — {kcal} ккал добавлено!\n\n"
@@ -744,7 +790,9 @@ async def _save_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def workout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _sync_user(update)
+    _log_user_msg(update, extra="🏋️ тренировка — старт")
     logger.debug("Начало добавления тренировки: user_id=%d", update.effective_user.id)
+    _log_bot_reply(update.effective_user.id, "Введи название тренировки:", extra="workout-prompt")
     await update.message.reply_text(
         "Введи название тренировки:\n"
         "_(или сразу «Название Калории», например «Бег 300»)_",
@@ -759,6 +807,8 @@ async def received_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     uid  = update.effective_user.id
 
     if text == "❌ Отмена":
+        _log_user_msg(update, extra="отмена тренировки")
+        _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
@@ -770,6 +820,8 @@ async def received_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 raise ValueError
             context.user_data["workout_name"] = parts[0]
             context.user_data["workout_kcal"] = kcal
+            logger.debug("Быстрый ввод тренировки: user_id=%d «%s» %d ккал", uid, parts[0], kcal)
+            _log_user_msg(update, extra=f"быстрый ввод тренировки: {parts[0]} {kcal} ккал")
             return await _save_workout(update, context)
         except ValueError:
             pass
@@ -788,6 +840,8 @@ async def received_workout_kcal(update: Update, context: ContextTypes.DEFAULT_TY
     uid  = update.effective_user.id
 
     if text == "❌ Отмена":
+        _log_user_msg(update, extra="отмена ввода ккал тренировки")
+        _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
@@ -796,6 +850,8 @@ async def received_workout_kcal(update: Update, context: ContextTypes.DEFAULT_TY
         if kcal <= 0:
             raise ValueError
     except ValueError:
+        _log_user_msg(update, extra=f"некорректные ккал тренировки: {text!r}")
+        _log_bot_reply(uid, "⚠️ Введи целое положительное число:", extra="validation-error")
         await update.message.reply_text("⚠️ Введи целое положительное число:")
         return WAITING_WORKOUT_KCAL
 
@@ -822,6 +878,7 @@ async def _save_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "Тренировка сохранена: user_id=%d  «%s» %d ккал  net=%d",
         uid, name, kcal, net,
     )
+    _log_bot_reply(uid, f"🏋️ {name} — сожжено {kcal} ккал | net={net}/{goal}", extra="workout-saved")
 
     msg = (
         f"🏋️ *{name}* — сожжено *{kcal}* ккал!\n\n"
@@ -890,7 +947,9 @@ def _parse_positive_float(text: str, min_val: float, max_val: float):
 
 async def treadmill_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _sync_user(update)
+    _log_user_msg(update, extra="🏃 беговая дорожка — старт")
     logger.debug("Калькулятор дорожки: user_id=%d", update.effective_user.id)
+    _log_bot_reply(update.effective_user.id, "Введи среднюю ЧСС:", extra="treadmill-hr-prompt")
     await update.message.reply_text(
         "🏃 *Калькулятор беговой дорожки*\n\n"
         "Введи среднюю *ЧСС* во время тренировки (уд/мин, 40–220):",
@@ -905,79 +964,126 @@ async def _treadmill_cancel_check(update: Update) -> bool:
 
 
 async def treadmill_hr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
     if await _treadmill_cancel_check(update):
+        _log_user_msg(update, extra="отмена на шаге ЧСС")
+        _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
     val = _parse_positive_float(update.message.text, 40, 220)
     if val is None:
+        _log_user_msg(update, extra=f"некорректная ЧСС: {update.message.text!r}")
+        _log_bot_reply(uid, "⚠️ Введи число от 40 до 220:", extra="validation-error")
         await update.message.reply_text("⚠️ Введи число от 40 до 220:")
         return TREADMILL_HR
     context.user_data["tm_hr"] = val
+    logger.debug("Дорожка ЧСС: user_id=%d  hr=%.0f", uid, val)
+    _log_user_msg(update, extra=f"ЧСС={val}")
+    _log_bot_reply(uid, "Уклон дорожки (%, 0–30):", extra="treadmill-incline-prompt")
     await update.message.reply_text("Уклон дорожки (%, 0–30):", reply_markup=CANCEL_KEYBOARD)
     return TREADMILL_INCLINE
 
 
 async def treadmill_incline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
     if await _treadmill_cancel_check(update):
+        _log_user_msg(update, extra="отмена на шаге уклон")
+        _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
     val = _parse_positive_float(update.message.text, 0, 30)
     if val is None:
+        _log_user_msg(update, extra=f"некорректный уклон: {update.message.text!r}")
+        _log_bot_reply(uid, "⚠️ Введи число от 0 до 30:", extra="validation-error")
         await update.message.reply_text("⚠️ Введи число от 0 до 30:")
         return TREADMILL_INCLINE
     context.user_data["tm_incline"] = val
+    logger.debug("Дорожка уклон: user_id=%d  incline=%.1f%%", uid, val)
+    _log_user_msg(update, extra=f"уклон={val}%")
+    _log_bot_reply(uid, "Средняя скорость (км/ч, 1–30):", extra="treadmill-speed-prompt")
     await update.message.reply_text("Средняя скорость (км/ч, 1–30):", reply_markup=CANCEL_KEYBOARD)
     return TREADMILL_SPEED
 
 
 async def treadmill_speed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
     if await _treadmill_cancel_check(update):
+        _log_user_msg(update, extra="отмена на шаге скорость")
+        _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
     val = _parse_positive_float(update.message.text, 1, 30)
     if val is None:
+        _log_user_msg(update, extra=f"некорректная скорость: {update.message.text!r}")
+        _log_bot_reply(uid, "⚠️ Введи число от 1 до 30:", extra="validation-error")
         await update.message.reply_text("⚠️ Введи число от 1 до 30:")
         return TREADMILL_SPEED
     context.user_data["tm_speed"] = val
+    logger.debug("Дорожка скорость: user_id=%d  speed=%.1f км/ч", uid, val)
+    _log_user_msg(update, extra=f"скорость={val} км/ч")
+    _log_bot_reply(uid, "Время тренировки (мин, 1–300):", extra="treadmill-duration-prompt")
     await update.message.reply_text("Время тренировки (мин, 1–300):", reply_markup=CANCEL_KEYBOARD)
     return TREADMILL_DURATION
 
 
 async def treadmill_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
     if await _treadmill_cancel_check(update):
+        _log_user_msg(update, extra="отмена на шаге длительность")
+        _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
     val = _parse_positive_float(update.message.text, 1, 300)
     if val is None:
+        _log_user_msg(update, extra=f"некорректная длительность: {update.message.text!r}")
+        _log_bot_reply(uid, "⚠️ Введи число от 1 до 300:", extra="validation-error")
         await update.message.reply_text("⚠️ Введи число от 1 до 300:")
         return TREADMILL_DURATION
     context.user_data["tm_duration"] = val
+    logger.debug("Дорожка длительность: user_id=%d  duration=%.0f мин", uid, val)
+    _log_user_msg(update, extra=f"длительность={val} мин")
+    _log_bot_reply(uid, "Твой возраст (лет, 10–100):", extra="treadmill-age-prompt")
     await update.message.reply_text("Твой возраст (лет, 10–100):", reply_markup=CANCEL_KEYBOARD)
     return TREADMILL_AGE
 
 
 async def treadmill_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
     if await _treadmill_cancel_check(update):
+        _log_user_msg(update, extra="отмена на шаге возраст")
+        _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
     val = _parse_positive_float(update.message.text, 10, 100)
     if val is None:
+        _log_user_msg(update, extra=f"некорректный возраст: {update.message.text!r}")
+        _log_bot_reply(uid, "⚠️ Введи число от 10 до 100:", extra="validation-error")
         await update.message.reply_text("⚠️ Введи число от 10 до 100:")
         return TREADMILL_AGE
     context.user_data["tm_age"] = int(val)
+    logger.debug("Дорожка возраст: user_id=%d  age=%d", uid, int(val))
+    _log_user_msg(update, extra=f"возраст={int(val)}")
+    _log_bot_reply(uid, "Масса тела (кг, 30–250):", extra="treadmill-weight-prompt")
     await update.message.reply_text("Масса тела (кг, 30–250):", reply_markup=CANCEL_KEYBOARD)
     return TREADMILL_WEIGHT
 
 
 async def treadmill_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
     if await _treadmill_cancel_check(update):
+        _log_user_msg(update, extra="отмена на шаге вес")
+        _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
     val = _parse_positive_float(update.message.text, 30, 250)
     if val is None:
+        _log_user_msg(update, extra=f"некорректный вес: {update.message.text!r}")
+        _log_bot_reply(uid, "⚠️ Введи число от 30 до 250:", extra="validation-error")
         await update.message.reply_text("⚠️ Введи число от 30 до 250:")
         return TREADMILL_WEIGHT
     context.user_data["tm_weight"] = val
+    logger.debug("Дорожка вес: user_id=%d  weight=%.1f кг", uid, val)
+    _log_user_msg(update, extra=f"вес={val} кг")
 
     ud  = context.user_data
     res = _calc_treadmill(
@@ -993,6 +1099,7 @@ async def treadmill_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "Калькулятор дорожки: user_id=%d  kcal=%.1f  dist=%.2f km",
         uid, res["total_kcal"], res["distance_km"],
     )
+    _log_bot_reply(uid, f"🏃 Итого сожжено: {res['total_kcal']} ккал | дистанция={res['distance_km']} км", extra="treadmill-result")
 
     # Предложение добавить как тренировку
     from telegram import InlineKeyboardMarkup, InlineKeyboardButton
@@ -1039,6 +1146,7 @@ async def treadmill_add_callback(update: Update, context: ContextTypes.DEFAULT_T
     bar      = _progress_bar(net, goal)
 
     logger.info("Тренировка с дорожки добавлена: user_id=%d  %d ккал", uid, kcal)
+    _log_bot_reply(uid, f"✅ {name} — {kcal} ккал добавлено в тренировки! net={net}/{goal}", extra="treadmill-workout-saved")
 
     await query.edit_message_text(
         f"✅ *{name}* — {kcal} ккал добавлено в тренировки!\n\n"
@@ -1051,7 +1159,10 @@ async def treadmill_add_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.debug("ConversationHandler отменён: user_id=%d", update.effective_user.id)
+    uid = update.effective_user.id
+    _log_user_msg(update, extra="/cancel")
+    logger.debug("ConversationHandler отменён: user_id=%d", uid)
+    _log_bot_reply(uid, "Отменено.", extra="cancel")
     await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -1065,6 +1176,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     entries = db_get_day(uid, today)
     goal    = db_get_goal(uid)
 
+    _log_user_msg(update, extra="📊 сводка за день")
     logger.info("Сводка запрошена: user_id=%d  записей=%d", uid, len(entries))
 
     if not entries:
@@ -1122,6 +1234,7 @@ async def deficit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     today = _today()
     goal  = db_get_goal(uid)
 
+    _log_user_msg(update, extra="📉 дефицит калорий")
     logger.info("Дефицит запрошен: user_id=%d  goal=%d", uid, goal)
 
     all_rows = db_all_days(uid)
@@ -1191,6 +1304,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     goal = db_get_goal(uid)
     rows = db_all_days(uid)
 
+    _log_user_msg(update, extra="📅 история")
     logger.info("История запрошена: user_id=%d  дней=%d", uid, len(rows))
 
     if not rows:
@@ -1228,6 +1342,7 @@ async def set_goal_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     _sync_user(update)
     uid  = update.effective_user.id
     goal = db_get_goal(uid)
+    _log_user_msg(update, extra=f"🎯 установить цель (текущая={goal})")
     logger.debug("Просмотр цели: user_id=%d  goal=%d", uid, goal)
     await update.message.reply_text(
         f"Текущая цель: *{goal}* ккал/день\n\n"
@@ -1250,10 +1365,14 @@ async def set_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             raise ValueError
     except ValueError:
         logger.warning("Некорректная цель от user_id=%d: %s", uid, context.args)
+        _log_user_msg(update, extra=f"некорректная цель: {context.args}")
+        _log_bot_reply(uid, "⚠️ Введи число: /goal 2000", extra="validation-error")
         await update.message.reply_text("⚠️ Введи число: `/goal 2000`", parse_mode="Markdown")
         return
 
     db_set_goal(uid, new_goal)
+    _log_user_msg(update, extra=f"/goal {new_goal}")
+    _log_bot_reply(uid, f"🎯 Цель обновлена: {new_goal} ккал/день", extra="goal-updated")
     await update.message.reply_text(
         f"🎯 Цель обновлена: *{new_goal}* ккал/день",
         parse_mode="Markdown",
@@ -1266,6 +1385,7 @@ async def set_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def clear_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _sync_user(update)
     uid     = update.effective_user.id
+    _log_user_msg(update, extra="🗑 очистить день")
     today   = _today()
     deleted = db_clear_day(uid, today)
 
@@ -1334,8 +1454,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ║                     Photo → Calories  (OpenRouter / Gemini Flash free)      ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"   # бесплатная vision-модель
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Список моделей по приоритету качества — все бесплатные, с поддержкой Vision.
+# При 429/недоступности одной — автоматически переходим к следующей.
+OPENROUTER_MODELS = [                      # Vision, альтернативный провайдер
+    "nvidia/nemotron-nano-12b-v2-vl:free",            # запасной — проверенный рабочий
+]
 
 PHOTO_SYSTEM = (
     "Ты диетолог-нутрициолог. Пользователь присылает фото еды.\n\n"
@@ -1353,8 +1478,120 @@ PHOTO_SYSTEM = (
 )
 
 
-def _analyze_photo_openrouter(image_bytes: bytes, mime: str = "image/jpeg", extra_info: str = "") -> dict | None:
-    """Отправляет фото в OpenRouter и возвращает dict {name, kcal, note} или None."""
+def _call_openrouter_model(
+    model: str,
+    b64: str,
+    mime: str,
+    user_text: str,
+    api_key: str,
+    retries: int = 2,
+    retry_delay: float = 3.0,
+) -> dict | None:
+    """Один запрос к конкретной модели с retry при сетевых ошибках и обрезанном JSON.
+    Возвращает распарсенный dict или None. При 429 возвращает None сразу (без retry).
+    """
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": PHOTO_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    },
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ],
+        "max_tokens": 600,
+    }).encode()
+
+    req = urllib.request.Request(
+        OPENROUTER_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://github.com/calorie-bot",
+            "X-Title": "Calorie Telegram Bot",
+        },
+        method="POST",
+    )
+
+    for attempt in range(1, retries + 1):
+        data = None
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            if e.code == 429:
+                # Rate limit — эту модель пропускаем, смысла повторять нет
+                logger.warning("OpenRouter 429 [%s] — пропускаем модель: %s", model, body[:120])
+                return None
+            logger.warning("OpenRouter HTTP %d [%s] (попытка %d/%d): %s",
+                           e.code, model, attempt, retries, body[:200])
+            if attempt < retries:
+                time.sleep(retry_delay)
+            continue
+        except Exception as exc:
+            logger.warning("OpenRouter сеть [%s] (попытка %d/%d): %s",
+                           model, attempt, retries, exc)
+            if attempt < retries:
+                time.sleep(retry_delay)
+            continue
+
+        try:
+            content = data["choices"][0]["message"]["content"].strip()
+            finish_reason = data["choices"][0].get("finish_reason", "")
+            if finish_reason == "length":
+                logger.warning("OpenRouter обрезанный ответ (finish_reason=length) [%s] попытка %d/%d",
+                               model, attempt, retries)
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                continue
+            content = content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            parsed  = json.loads(content)
+
+            if isinstance(parsed, list):
+                if not parsed:
+                    raise ValueError("Пустой список блюд")
+                if len(parsed) == 1:
+                    result = parsed[0]
+                else:
+                    total_kcal = sum(int(item.get("kcal", 0)) for item in parsed)
+                    names      = ", ".join(item.get("name", "?") for item in parsed)
+                    notes      = "; ".join(item.get("note", "") for item in parsed if item.get("note"))
+                    result     = {"name": names, "kcal": total_kcal, "note": notes}
+            else:
+                result = parsed
+
+            result["kcal"] = int(result["kcal"])
+            return result
+
+        except Exception as exc:
+            logger.warning("Не удалось разобрать ответ [%s] попытка %d/%d: %s",
+                           model, attempt, retries, exc)
+            if attempt < retries:
+                time.sleep(retry_delay)
+
+    return None
+
+
+def _analyze_photo_openrouter(
+    image_bytes: bytes,
+    mime: str = "image/jpeg",
+    extra_info: str = "",
+) -> dict | None:
+    """Отправляет фото в OpenRouter, перебирая модели из OPENROUTER_MODELS.
+
+    Стратегия:
+    - 429 (rate limit) → сразу следующая модель
+    - Сетевая ошибка / плохой JSON → до 2 повторов на той же модели, потом следующая
+    - Если все модели недоступны → None
+    """
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
         logger.warning("OPENROUTER_API_KEY не задан, анализ фото пропущен")
@@ -1370,73 +1607,19 @@ def _analyze_photo_openrouter(image_bytes: bytes, mime: str = "image/jpeg", extr
             "Фото — только для оценки размера порции если вес не указан."
         )
 
-    payload = json.dumps({
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": PHOTO_SYSTEM},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{b64}"},
-                    },
-                    {"type": "text", "text": user_text},
-                ],
-            },
-        ],
-        "max_tokens": 300,
-    }).encode()
-
-    req = urllib.request.Request(
-        OPENROUTER_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "HTTP-Referer": "https://github.com/calorie-bot",
-            "X-Title": "Calorie Telegram Bot",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        logger.error("OpenRouter HTTP %d: %s", e.code, body)
-        return None
-    except Exception as exc:
-        logger.error("OpenRouter error: %s", exc)
-        return None
-
-    try:
-        content = data["choices"][0]["message"]["content"].strip()
-        # Убираем возможные ```json ... ``` обёртки
-        content = content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        parsed = json.loads(content)
-
-        # Модель может вернуть список блюд или один объект
-        if isinstance(parsed, list):
-            if not parsed:
-                raise ValueError("Пустой список блюд")
-            if len(parsed) == 1:
-                result = parsed[0]
+    for i, model in enumerate(OPENROUTER_MODELS, 1):
+        logger.debug("OpenRouter: пробуем модель %d/%d — %s", i, len(OPENROUTER_MODELS), model)
+        result = _call_openrouter_model(model, b64, mime, user_text, api_key)
+        if result is not None:
+            if i > 1:
+                logger.info("OpenRouter: успех на модели %d/%d — %s", i, len(OPENROUTER_MODELS), model)
             else:
-                # Несколько блюд — суммируем калории, объединяем названия
-                total_kcal = sum(int(item.get("kcal", 0)) for item in parsed)
-                names      = ", ".join(item.get("name", "?") for item in parsed)
-                notes      = "; ".join(item.get("note", "") for item in parsed if item.get("note"))
-                result     = {"name": names, "kcal": total_kcal, "note": notes}
-        else:
-            result = parsed
+                logger.debug("OpenRouter: успех — %s", model)
+            return result
+        logger.warning("OpenRouter: модель %s не дала результат, пробуем следующую…", model)
 
-        result["kcal"] = int(result["kcal"])
-        return result
-    except Exception as exc:
-        logger.error("Не удалось разобрать ответ OpenRouter: %s | raw: %s", exc, data)
-        return None
+    logger.error("OpenRouter: все %d моделей исчерпаны, анализ фото не удался", len(OPENROUTER_MODELS))
+    return None
 
 
 # ── Photo handlers ─────────────────────────────────────────────────────────────
@@ -1458,6 +1641,8 @@ async def photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
 
     logger.debug("Начало анализа фото: user_id=%d", uid)
+    _log_user_msg(update, extra="📷 фото еды — старт")
+    _log_bot_reply(uid, "📷 Пришли фото блюда — я определю состав и оценю калории.", extra="photo-prompt")
     await update.message.reply_text(
         "📷 *Пришли фото блюда* — я определю состав и оценю калории.\n\n"
         "_Лучшее качество: вид сверху, хорошее освещение, порция целиком._",
@@ -1479,6 +1664,8 @@ async def photo_got_image(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return PHOTO_CAPTION
 
     # Сохраняем file_id — скачаем позже, после уточнения
+    _log_user_msg(update, extra=f"📷 фото получено file_id={update.message.photo[-1].file_id[:20]}…")
+    logger.debug("Фото получено: user_id=%d  file_id=%s", uid, update.message.photo[-1].file_id[:20])
     context.user_data["photo_file_id"] = update.message.photo[-1].file_id
     # Если пользователь прислал подпись прямо к фото — сразу используем
     caption = (update.message.caption or "").strip()
@@ -1519,6 +1706,8 @@ async def photo_got_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             db_add_entry(uid, name, kcal)
             badge = _kcal_badge(kcal)
             logger.info("Фото-запись сохранена: user_id=%d «%s» %d ккал", uid, name, kcal)
+            _log_user_msg(update, extra=f"✅ подтверждение сохранения фото: {name} {kcal} ккал")
+            _log_bot_reply(uid, f"✅ Записано: {name} — {kcal} ккал", extra="photo-saved")
             context.user_data.clear()
             await update.message.reply_text(
                 f"✅ Записано: {badge} *{name}* — *{kcal}* ккал",
@@ -1549,6 +1738,8 @@ async def photo_got_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             db_add_entry(uid, name, kcal)
             badge = _kcal_badge(kcal)
             logger.info("Фото-запись (ручная) сохранена: user_id=%d «%s» %d ккал", uid, name, kcal)
+            _log_user_msg(update, extra=f"✏️ ручные ккал к фото: {name} {kcal} ккал")
+            _log_bot_reply(uid, f"✅ Записано (ручная): {name} — {kcal} ккал", extra="photo-manual-saved")
             context.user_data.clear()
             await update.message.reply_text(
                 f"✅ Записано: {badge} *{name}* — *{kcal}* ккал",
@@ -1572,8 +1763,14 @@ async def photo_got_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     if extra:
+        logger.debug("Фото уточнение: user_id=%d  extra=%s", uid, extra[:60])
+        _log_user_msg(update, extra=f"уточнение состава: {extra[:60]}")
+        _log_bot_reply(uid, f"🔍 Анализирую с учётом: {extra[:40]}…", extra="photo-analyzing")
         await update.message.reply_text(f"🔍 Анализирую с учётом: _{extra}_…", parse_mode="Markdown")
     else:
+        logger.debug("Фото без уточнений: user_id=%d", uid)
+        _log_user_msg(update, extra="пропустить уточнение")
+        _log_bot_reply(uid, "🔍 Анализирую фото, подожди секунду…", extra="photo-analyzing")
         await update.message.reply_text("🔍 Анализирую фото, подожди секунду…")
 
     photo_file  = await context.bot.get_file(file_id)
@@ -1597,6 +1794,8 @@ async def photo_got_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data["_photo_analyzed"] = True
 
     badge = _kcal_badge(kcal)
+    logger.info("Фото проанализировано: user_id=%d  «%s» %d ккал", uid, name, kcal)
+    _log_bot_reply(uid, f"🍽 {name} — оценка: {kcal} ккал | note: {note[:60]}", extra="photo-result")
     confirm_keyboard = ReplyKeyboardMarkup(
         [
             [KeyboardButton(f"✅ Сохранить {kcal} ккал")],
