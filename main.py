@@ -703,7 +703,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _build_food_keyboard(uid: int) -> ReplyKeyboardMarkup:
     """Клавиатура с последними 15 уникальными продуктами + кнопка отмены."""
-    recent = db_recent_food(uid, limit=15)
+    recent = db_recent_food(uid, limit=16)
     rows = []
     for i in range(0, len(recent), 2):
         pair = []
@@ -720,7 +720,7 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _log_user_msg(update, extra="➕ добавить еду — старт")
     logger.debug("Начало добавления еды: user_id=%d", uid)
 
-    recent = db_recent_food(uid, limit=15)
+    recent = db_recent_food(uid, limit=16)
     if recent:
         keyboard = _build_food_keyboard(uid)
         hint = (
