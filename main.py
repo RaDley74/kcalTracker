@@ -302,21 +302,16 @@ def db_add_entry(user_id: int, name: str, kcal: int) -> None:
 
 
 def db_recent_food(user_id: int, limit: int = 15) -> list[sqlite3.Row]:
-    """Последние уникальные продукты пользователя (по имени, самые свежие)."""
+    """Последние уникальные продукты пользователя (уникальные по имени и калорийности)."""
     with get_conn() as conn:
         return conn.execute(
             """SELECT name, kcal
-               FROM (
-                   SELECT name, kcal,
-                          ROW_NUMBER() OVER (PARTITION BY name ORDER BY logged_at DESC) AS rn
-                   FROM food_log
-                   WHERE user_id = ?
-               )
-               WHERE rn = 1
-               ORDER BY (SELECT MAX(logged_at) FROM food_log
-                         WHERE user_id = ? AND name = food_log.name) DESC
+               FROM food_log
+               WHERE user_id = ?
+               GROUP BY name, kcal
+               ORDER BY MAX(logged_at) DESC
                LIMIT ?""",
-            (user_id, user_id, limit),
+            (user_id, limit),
         ).fetchall()
 
 
