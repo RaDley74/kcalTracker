@@ -441,6 +441,70 @@ def db_workout_kcal_day(user_id: int, day: str) -> int:
     return sum(r["kcal"] for r in rows)
 
 
+def db_get_day_with_ids(user_id: int, day: str) -> list[sqlite3.Row]:
+    """Еда за день с id записей."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id, name, kcal, logged_at FROM food_log "
+            "WHERE user_id=? AND log_date=? ORDER BY logged_at",
+            (user_id, day),
+        ).fetchall()
+
+
+def db_get_workouts_day_with_ids(user_id: int, day: str) -> list[sqlite3.Row]:
+    """Тренировки за день с id записей."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id, name, kcal, logged_at FROM workout_log "
+            "WHERE user_id=? AND log_date=? ORDER BY logged_at",
+            (user_id, day),
+        ).fetchall()
+
+
+def db_delete_food(user_id: int, entry_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM food_log WHERE id=? AND user_id=?", (entry_id, user_id)
+        )
+    deleted = cur.rowcount > 0
+    if deleted:
+        logger.info("Запись еды удалена: user_id=%d  id=%d", user_id, entry_id)
+    return deleted
+
+
+def db_delete_workout(user_id: int, entry_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM workout_log WHERE id=? AND user_id=?", (entry_id, user_id)
+        )
+    deleted = cur.rowcount > 0
+    if deleted:
+        logger.info("Запись тренировки удалена: user_id=%d  id=%d", user_id, entry_id)
+    return deleted
+
+
+def db_add_entry_for_date(user_id: int, name: str, kcal: int, day: str) -> None:
+    """Добавить запись еды за произвольную дату."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO food_log(user_id, name, kcal, logged_at, log_date) VALUES(?,?,?,?,?)",
+            (user_id, name, kcal, now, day),
+        )
+    logger.info("Запись добавлена (дата=%s): user_id=%d  «%s» %d ккал", day, user_id, name, kcal)
+
+
+def db_add_workout_for_date(user_id: int, name: str, kcal: int, day: str) -> None:
+    """Добавить тренировку за произвольную дату."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO workout_log(user_id, name, kcal, logged_at, log_date) VALUES(?,?,?,?,?)",
+            (user_id, name, kcal, now, day),
+        )
+    logger.info("Тренировка добавлена (дата=%s): user_id=%d  «%s» %d ккал", day, user_id, name, kcal)
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║                          Telegram bot                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -457,7 +521,10 @@ from telegram.ext import (
     TREADMILL_HR, TREADMILL_INCLINE, TREADMILL_SPEED,
     TREADMILL_DURATION, TREADMILL_AGE, TREADMILL_WEIGHT,
     PHOTO_CONFIRM_KCAL, PHOTO_CAPTION,
-) = range(12)
+    EDIT_SELECT_DATE, EDIT_SELECT_ACTION, EDIT_SELECT_ENTRY,
+    EDIT_ADD_FOOD_NAME, EDIT_ADD_FOOD_KCAL,
+    EDIT_ADD_WORKOUT_NAME, EDIT_ADD_WORKOUT_KCAL,
+) = range(19)
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
@@ -467,7 +534,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton("📷 Фото еды → калории"), KeyboardButton("🏃 Беговая дорожка")],
         [KeyboardButton("📊 Сводка за день"),     KeyboardButton("📉 Дефицит калорий")],
         [KeyboardButton("📅 История"),            KeyboardButton("🎯 Установить цель")],
-        [KeyboardButton("🗑 Очистить день"),      KeyboardButton("❓ Помощь")],
+        [KeyboardButton("✏️ Редактировать день"), KeyboardButton("🗑 Очистить день")],
+        [KeyboardButton("❓ Помощь")],
     ],
     resize_keyboard=True,
 )
@@ -1402,6 +1470,358 @@ async def clear_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# ── Edit past days ────────────────────────────────────────────────────────────
+
+def _edit_day_summary(uid: int, day: str) -> str:
+    """Текстовая сводка дня для экрана редактирования."""
+    food = db_get_day_with_ids(uid, day)
+    workouts = db_get_workouts_day_with_ids(uid, day)
+    lines = [f"✏️ *Редактирование: {day}*\n"]
+    if food:
+        lines.append("🍽 *Еда:*")
+        for i, r in enumerate(food, 1):
+            badge = _kcal_badge(r["kcal"])
+            lines.append(f"  {i}. {badge} {r['name']} — {r['kcal']} ккал")
+    else:
+        lines.append("🍽 *Еда:* пусто")
+    if workouts:
+        lines.append("🏋️ *Тренировки:*")
+        for i, r in enumerate(workouts, 1):
+            lines.append(f"  {i}. 🔥 {r['name']} — {r['kcal']} ккал")
+    else:
+        lines.append("🏋️ *Тренировки:* пусто")
+    total_food = sum(r["kcal"] for r in food)
+    total_burn = sum(r["kcal"] for r in workouts)
+    lines.append(f"\n🍽 Итого еды: *{total_food}* ккал  |  🔥 Сожжено: *{total_burn}* ккал")
+    return "\n".join(lines)
+
+
+def _edit_action_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("➕ Добавить еду"),       KeyboardButton("➕ Добавить тренировку")],
+            [KeyboardButton("🗑 Удалить запись еды"),  KeyboardButton("🗑 Удалить тренировку")],
+            [KeyboardButton("❌ Отмена")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _sync_user(update)
+    uid  = update.effective_user.id
+    rows = db_all_days(uid)
+    _log_user_msg(update, extra="✏️ редактировать день — старт")
+
+    if not rows:
+        await update.message.reply_text(
+            "История пуста — нечего редактировать.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    # Показываем последние 14 дней
+    recent = rows[:14]
+    date_buttons = []
+    for i in range(0, len(recent), 2):
+        pair = [KeyboardButton(r["log_date"]) for r in recent[i:i+2]]
+        date_buttons.append(pair)
+    date_buttons.append([KeyboardButton("❌ Отмена")])
+
+    await update.message.reply_text(
+        "📅 Выбери дату для редактирования:",
+        reply_markup=ReplyKeyboardMarkup(date_buttons, resize_keyboard=True),
+    )
+    return EDIT_SELECT_DATE
+
+
+async def edit_select_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    uid  = update.effective_user.id
+
+    if text == "❌ Отмена":
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+    import re
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        await update.message.reply_text("⚠️ Выбери дату из списка.")
+        return EDIT_SELECT_DATE
+
+    context.user_data["edit_date"] = text
+    logger.debug("Редактирование даты: user_id=%d  date=%s", uid, text)
+
+    summary_text = _edit_day_summary(uid, text)
+    await update.message.reply_text(
+        summary_text + "\n\nЧто хочешь сделать?",
+        parse_mode="Markdown",
+        reply_markup=_edit_action_keyboard(),
+    )
+    return EDIT_SELECT_ACTION
+
+
+async def edit_select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    uid  = update.effective_user.id
+    day  = context.user_data.get("edit_date", _today())
+
+    if text == "❌ Отмена":
+        await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+    if text == "➕ Добавить еду":
+        context.user_data["edit_adding"] = "food"
+        await update.message.reply_text(
+            f"Введи название еды для *{day}*:\n"
+            "_(или сразу «Название Калории», например «Гречка 280»)_",
+            parse_mode="Markdown",
+            reply_markup=CANCEL_KEYBOARD,
+        )
+        return EDIT_ADD_FOOD_NAME
+
+    if text == "➕ Добавить тренировку":
+        context.user_data["edit_adding"] = "workout"
+        await update.message.reply_text(
+            f"Введи название тренировки для *{day}*:\n"
+            "_(или сразу «Название Калории», например «Бег 300»)_",
+            parse_mode="Markdown",
+            reply_markup=CANCEL_KEYBOARD,
+        )
+        return EDIT_ADD_WORKOUT_NAME
+
+    if text == "🗑 Удалить запись еды":
+        food = db_get_day_with_ids(uid, day)
+        if not food:
+            await update.message.reply_text(
+                "Нет записей еды за этот день.",
+                reply_markup=_edit_action_keyboard(),
+            )
+            return EDIT_SELECT_ACTION
+        context.user_data["edit_delete_type"] = "food"
+        buttons = [
+            [KeyboardButton(f"🍽 {r['name']} — {r['kcal']} ккал [id:{r['id']}]")]
+            for r in food
+        ]
+        buttons.append([KeyboardButton("❌ Отмена")])
+        await update.message.reply_text(
+            "Выбери запись для удаления:",
+            reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True),
+        )
+        return EDIT_SELECT_ENTRY
+
+    if text == "🗑 Удалить тренировку":
+        workouts = db_get_workouts_day_with_ids(uid, day)
+        if not workouts:
+            await update.message.reply_text(
+                "Нет тренировок за этот день.",
+                reply_markup=_edit_action_keyboard(),
+            )
+            return EDIT_SELECT_ACTION
+        context.user_data["edit_delete_type"] = "workout"
+        buttons = [
+            [KeyboardButton(f"🏋️ {r['name']} — {r['kcal']} ккал [id:{r['id']}]")]
+            for r in workouts
+        ]
+        buttons.append([KeyboardButton("❌ Отмена")])
+        await update.message.reply_text(
+            "Выбери тренировку для удаления:",
+            reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True),
+        )
+        return EDIT_SELECT_ENTRY
+
+    await update.message.reply_text("Используй кнопки.", reply_markup=_edit_action_keyboard())
+    return EDIT_SELECT_ACTION
+
+
+async def edit_select_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает выбор записи для удаления."""
+    import re
+    text = update.message.text.strip()
+    uid  = update.effective_user.id
+    day  = context.user_data.get("edit_date", _today())
+    dtype = context.user_data.get("edit_delete_type", "food")
+
+    if text == "❌ Отмена":
+        summary_text = _edit_day_summary(uid, day)
+        await update.message.reply_text(
+            summary_text + "\n\nЧто хочешь сделать?",
+            parse_mode="Markdown",
+            reply_markup=_edit_action_keyboard(),
+        )
+        return EDIT_SELECT_ACTION
+
+    m = re.search(r"\[id:(\d+)\]", text)
+    if not m:
+        await update.message.reply_text("⚠️ Выбери запись из списка.")
+        return EDIT_SELECT_ENTRY
+
+    entry_id = int(m.group(1))
+    if dtype == "food":
+        deleted = db_delete_food(uid, entry_id)
+        what = "Запись еды"
+    else:
+        deleted = db_delete_workout(uid, entry_id)
+        what = "Тренировка"
+
+    if deleted:
+        logger.info("Удалена запись id=%d тип=%s user_id=%d дата=%s", entry_id, dtype, uid, day)
+        summary_text = _edit_day_summary(uid, day)
+        await update.message.reply_text(
+            f"✅ {what} удалена.\n\n" + summary_text + "\n\nЧто ещё хочешь сделать?",
+            parse_mode="Markdown",
+            reply_markup=_edit_action_keyboard(),
+        )
+    else:
+        await update.message.reply_text("⚠️ Не удалось удалить запись.", reply_markup=_edit_action_keyboard())
+
+    return EDIT_SELECT_ACTION
+
+
+async def edit_add_food_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    uid  = update.effective_user.id
+    day  = context.user_data.get("edit_date", _today())
+
+    if text == "❌ Отмена":
+        summary_text = _edit_day_summary(uid, day)
+        await update.message.reply_text(
+            summary_text + "\n\nЧто хочешь сделать?",
+            parse_mode="Markdown",
+            reply_markup=_edit_action_keyboard(),
+        )
+        return EDIT_SELECT_ACTION
+
+    # Быстрый ввод "Название 300"
+    parts = text.rsplit(" ", 1)
+    if len(parts) == 2:
+        try:
+            kcal = int(parts[1])
+            if kcal > 0:
+                db_add_entry_for_date(uid, parts[0], kcal, day)
+                summary_text = _edit_day_summary(uid, day)
+                await update.message.reply_text(
+                    f"✅ Добавлено: *{parts[0]}* — {kcal} ккал\n\n" + summary_text + "\n\nЧто ещё хочешь сделать?",
+                    parse_mode="Markdown",
+                    reply_markup=_edit_action_keyboard(),
+                )
+                return EDIT_SELECT_ACTION
+        except ValueError:
+            pass
+
+    context.user_data["edit_new_name"] = text
+    await update.message.reply_text(
+        f"Сколько калорий в *{text}*?",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD,
+    )
+    return EDIT_ADD_FOOD_KCAL
+
+
+async def edit_add_food_kcal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    uid  = update.effective_user.id
+    day  = context.user_data.get("edit_date", _today())
+
+    if text == "❌ Отмена":
+        summary_text = _edit_day_summary(uid, day)
+        await update.message.reply_text(
+            summary_text + "\n\nЧто хочешь сделать?",
+            parse_mode="Markdown",
+            reply_markup=_edit_action_keyboard(),
+        )
+        return EDIT_SELECT_ACTION
+
+    try:
+        kcal = int(text)
+        if kcal <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Введи целое положительное число:")
+        return EDIT_ADD_FOOD_KCAL
+
+    name = context.user_data.get("edit_new_name", "Блюдо")
+    db_add_entry_for_date(uid, name, kcal, day)
+    summary_text = _edit_day_summary(uid, day)
+    await update.message.reply_text(
+        f"✅ Добавлено: *{name}* — {kcal} ккал\n\n" + summary_text + "\n\nЧто ещё хочешь сделать?",
+        parse_mode="Markdown",
+        reply_markup=_edit_action_keyboard(),
+    )
+    return EDIT_SELECT_ACTION
+
+
+async def edit_add_workout_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    uid  = update.effective_user.id
+    day  = context.user_data.get("edit_date", _today())
+
+    if text == "❌ Отмена":
+        summary_text = _edit_day_summary(uid, day)
+        await update.message.reply_text(
+            summary_text + "\n\nЧто хочешь сделать?",
+            parse_mode="Markdown",
+            reply_markup=_edit_action_keyboard(),
+        )
+        return EDIT_SELECT_ACTION
+
+    parts = text.rsplit(" ", 1)
+    if len(parts) == 2:
+        try:
+            kcal = int(parts[1])
+            if kcal > 0:
+                db_add_workout_for_date(uid, parts[0], kcal, day)
+                summary_text = _edit_day_summary(uid, day)
+                await update.message.reply_text(
+                    f"✅ Добавлена тренировка: *{parts[0]}* — {kcal} ккал\n\n" + summary_text + "\n\nЧто ещё хочешь сделать?",
+                    parse_mode="Markdown",
+                    reply_markup=_edit_action_keyboard(),
+                )
+                return EDIT_SELECT_ACTION
+        except ValueError:
+            pass
+
+    context.user_data["edit_new_name"] = text
+    await update.message.reply_text(
+        f"Сколько калорий сожжено в *{text}*?",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD,
+    )
+    return EDIT_ADD_WORKOUT_KCAL
+
+
+async def edit_add_workout_kcal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    uid  = update.effective_user.id
+    day  = context.user_data.get("edit_date", _today())
+
+    if text == "❌ Отмена":
+        summary_text = _edit_day_summary(uid, day)
+        await update.message.reply_text(
+            summary_text + "\n\nЧто хочешь сделать?",
+            parse_mode="Markdown",
+            reply_markup=_edit_action_keyboard(),
+        )
+        return EDIT_SELECT_ACTION
+
+    try:
+        kcal = int(text)
+        if kcal <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Введи целое положительное число:")
+        return EDIT_ADD_WORKOUT_KCAL
+
+    name = context.user_data.get("edit_new_name", "Тренировка")
+    db_add_workout_for_date(uid, name, kcal, day)
+    summary_text = _edit_day_summary(uid, day)
+    await update.message.reply_text(
+        f"✅ Добавлена тренировка: *{name}* — {kcal} ккал\n\n" + summary_text + "\n\nЧто ещё хочешь сделать?",
+        parse_mode="Markdown",
+        reply_markup=_edit_action_keyboard(),
+    )
+    return EDIT_SELECT_ACTION
+
+
 # ── Error handler ─────────────────────────────────────────────────────────────
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1420,16 +1840,17 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     logger.debug("Текстовое сообщение: user_id=%d  «%s»", uid, text[:60])
 
     routes = {
-        "➕ Добавить еду":          add_start,
-        "🏋️ Добавить тренировку":  workout_start,
-        "📷 Фото еды → калории":   photo_start,
-        "🏃 Беговая дорожка":      treadmill_start,
-        "📊 Сводка за день":       summary,
-        "📉 Дефицит калорий":      deficit,
-        "📅 История":              history,
-        "🎯 Установить цель":      set_goal_start,
-        "🗑 Очистить день":        clear_day,
-        "❓ Помощь":               help_cmd,
+        "➕ Добавить еду":           add_start,
+        "🏋️ Добавить тренировку":   workout_start,
+        "📷 Фото еды → калории":    photo_start,
+        "🏃 Беговая дорожка":       treadmill_start,
+        "📊 Сводка за день":        summary,
+        "📉 Дефицит калорий":       deficit,
+        "📅 История":               history,
+        "🎯 Установить цель":       set_goal_start,
+        "✏️ Редактировать день":    edit_start,
+        "🗑 Очистить день":         clear_day,
+        "❓ Помощь":                help_cmd,
     }
 
     handler = routes.get(text)
@@ -1890,6 +2311,23 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    edit_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("edit", edit_start),
+            MessageHandler(filters.Regex("^✏️ Редактировать день$"), edit_start),
+        ],
+        states={
+            EDIT_SELECT_DATE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_select_date)],
+            EDIT_SELECT_ACTION:     [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_select_action)],
+            EDIT_SELECT_ENTRY:      [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_select_entry)],
+            EDIT_ADD_FOOD_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_add_food_name)],
+            EDIT_ADD_FOOD_KCAL:     [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_add_food_kcal)],
+            EDIT_ADD_WORKOUT_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_add_workout_name)],
+            EDIT_ADD_WORKOUT_KCAL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_add_workout_kcal)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("help",       help_cmd))
     app.add_handler(CommandHandler("summary",    summary))
@@ -1920,6 +2358,7 @@ def main() -> None:
     app.add_handler(workout_conv)
     app.add_handler(treadmill_conv)
     app.add_handler(photo_conv)
+    app.add_handler(edit_conv)
     app.add_handler(CallbackQueryHandler(treadmill_add_callback, pattern=r"^tm_add:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
