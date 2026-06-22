@@ -1379,23 +1379,41 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = [f"📅 *История за всё время ({len(rows)} дн.)*\n"]
     for r in rows:
-        deficit_val = goal - r["total_kcal"]
+        workout_kcal = db_workout_kcal_day(uid, r["log_date"])
+        net_kcal     = r["total_kcal"] - workout_kcal
+        deficit_val  = goal - net_kcal
         if deficit_val > 0:
             status   = f"✅ −{deficit_val}"
             bar_mini = "🟩"
         else:
             status   = f"⚠️ +{abs(deficit_val)}"
             bar_mini = "🟥"
+
         lines.append(
-            f"{bar_mini} *{r['log_date']}*: {r['total_kcal']} ккал  "
-            f"{status} ккал  `{r['cnt']} зап.`"
+            f"{bar_mini} *{r['log_date']}*: {net_kcal} ккал  {status} ккал"
         )
 
-    for i, part in enumerate(_split_message(lines)):
+        # Еда
+        food = db_get_day(uid, r["log_date"])
+        for entry in food:
+            t = entry["logged_at"][11:16]  # HH:MM
+            badge = _kcal_badge(entry["kcal"])
+            lines.append(f"  {badge} `{t}` {entry['name']} — {entry['kcal']} ккал")
+
+        # Тренировки
+        workouts = db_get_workouts_day(uid, r["log_date"])
+        for w in workouts:
+            t = w["logged_at"][11:16]
+            lines.append(f"  🔥 `{t}` {w['name']} — −{w['kcal']} ккал")
+
+        lines.append("")  # пустая строка между днями
+
+    parts = _split_message(lines)
+    for i, part in enumerate(parts):
         await update.message.reply_text(
             "\n".join(part),
             parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD if i == len(_split_message(lines)) - 1 else None,
+            reply_markup=MAIN_KEYBOARD if i == len(parts) - 1 else None,
         )
 
 
@@ -1494,7 +1512,7 @@ def _edit_day_summary(uid: int, day: str) -> str:
 def _edit_action_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("➕ Добавить еду"),       KeyboardButton("➕ Добавить тренировку")],
+            [KeyboardButton("📝 Добавить еду (в этот день)"),       KeyboardButton("📝 Добавить тренировку (в этот день)")],
             [KeyboardButton("🗑 Удалить запись еды"),  KeyboardButton("🗑 Удалить тренировку")],
             [KeyboardButton("❌ Отмена")],
         ],
@@ -1505,21 +1523,14 @@ def _edit_action_keyboard() -> ReplyKeyboardMarkup:
 async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _sync_user(update)
     uid  = update.effective_user.id
-    rows = db_all_days(uid)
     _log_user_msg(update, extra="✏️ редактировать день — старт")
 
-    if not rows:
-        await update.message.reply_text(
-            "История пуста — нечего редактировать.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return ConversationHandler.END
-
-    # Показываем последние 14 дней
-    recent = rows[:14]
+    # Показываем последние 14 календарных дней (включая дни без записей)
+    today = date.today()
+    recent_dates = [(today - timedelta(days=i)).isoformat() for i in range(14)]
     date_buttons = []
-    for i in range(0, len(recent), 2):
-        pair = [KeyboardButton(r["log_date"]) for r in recent[i:i+2]]
+    for i in range(0, len(recent_dates), 2):
+        pair = [KeyboardButton(d) for d in recent_dates[i:i+2]]
         date_buttons.append(pair)
     date_buttons.append([KeyboardButton("❌ Отмена")])
 
@@ -1564,7 +1575,7 @@ async def edit_select_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
-    if text == "➕ Добавить еду":
+    if text == "📝 Добавить еду (в этот день)":
         context.user_data["edit_adding"] = "food"
         await update.message.reply_text(
             f"Введи название еды для *{day}*:\n"
@@ -1574,7 +1585,7 @@ async def edit_select_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return EDIT_ADD_FOOD_NAME
 
-    if text == "➕ Добавить тренировку":
+    if text == "📝 Добавить тренировку (в этот день)":
         context.user_data["edit_adding"] = "workout"
         await update.message.reply_text(
             f"Введи название тренировки для *{day}*:\n"
