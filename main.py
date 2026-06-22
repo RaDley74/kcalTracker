@@ -529,8 +529,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton("📷 Фото еды → калории"), KeyboardButton("🏃 Беговая дорожка")],
         [KeyboardButton("📊 Сводка за день"),     KeyboardButton("📉 Дефицит калорий")],
         [KeyboardButton("📅 История"),            KeyboardButton("🎯 Установить цель")],
-        [KeyboardButton("✏️ Редактировать день"), KeyboardButton("🗑 Очистить день")],
-        [KeyboardButton("❓ Помощь")],
+        [KeyboardButton("✏️ Редактировать день"), KeyboardButton("🗑 Очистить день")]
     ],
     resize_keyboard=True,
 )
