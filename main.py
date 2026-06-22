@@ -684,6 +684,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "2\\. Введи название продукта\n"
         "3\\. Введи количество калорий\n\n"
         "*Быстрый ввод еды:* пиши сразу `Овсянка 350`\n\n"
+        "*Ввод списком:* пришли несколько блюд, каждое с новой строки:\n"
+        "`Завтрак 289`\n"
+        "`Ролл лаваш 420`\n"
+        "`Куриная грудка 180г 200`\n\n"
         "🏋️ Нажми *Добавить тренировку* или /workout\n"
         "   Введи название и сожжённые калории\\.\n"
         "   Тренировки вычитаются из суточного потребления\\.\n\n"
@@ -725,18 +729,40 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         keyboard = _build_food_keyboard(uid)
         hint = (
             "Введи название продукта или блюда:\n"
-            "_(или сразу «Название Калории», например «Гречка 280»)_\n\n"
+            "_(или сразу «Название Калории», например «Гречка 280»)_\n"
+            "_(или списком — каждое блюдо на новой строке)_\n\n"
             "\u2b07\ufe0f Или выбери из недавних:"
         )
     else:
         keyboard = CANCEL_KEYBOARD
         hint = (
             "Введи название продукта или блюда:\n"
-            "_(или сразу «Название Калории», например «Гречка 280»)_"
+            "_(или сразу «Название Калории», например «Гречка 280»)_\n"
+            "_(или списком — каждое блюдо на новой строке)_"
         )
 
     await update.message.reply_text(hint, parse_mode="Markdown", reply_markup=keyboard)
     return WAITING_FOOD
+
+
+def _parse_food_line(line: str) -> tuple[str, int] | None:
+    """Разбирает строку вида «Гречка 50г 170» -> ('Гречка 50г', 170). None, если не похоже."""
+    line = line.strip()
+    if not line:
+        return None
+    parts = line.rsplit(" ", 1)
+    if len(parts) != 2:
+        return None
+    name = parts[0].strip()
+    if not name:
+        return None
+    try:
+        kcal = int(parts[1])
+    except ValueError:
+        return None
+    if kcal <= 0:
+        return None
+    return name, kcal
 
 
 async def received_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -749,6 +775,31 @@ async def received_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         _log_bot_reply(uid, "Отменено.", extra="cancel")
         await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
+
+    # Список из нескольких строк: каждая строка — отдельный продукт.
+    raw_lines = [l for l in text.splitlines() if l.strip()]
+    if len(raw_lines) > 1:
+        parsed  = [_parse_food_line(l) for l in raw_lines]
+        bad_idx = [i for i, p in enumerate(parsed) if p is None]
+        if bad_idx:
+            bad_lines = "\n".join(f"• {raw_lines[i]}" for i in bad_idx)
+            logger.warning("Список еды: некорректные строки от user_id=%d:\n%s", uid, bad_lines)
+            _log_user_msg(update, extra=f"список еды с ошибками: {bad_lines!r}")
+            await update.message.reply_text(
+                "⚠️ Не смог распознать калории в этих строках:\n"
+                f"{bad_lines}\n\n"
+                "Каждая строка должна заканчиваться числом калорий, например:\n"
+                "`Гречка 50г 170`\n\n"
+                "Исправь и отправь список заново, или введи одно блюдо.",
+                parse_mode="Markdown",
+                reply_markup=CANCEL_KEYBOARD,
+            )
+            return WAITING_FOOD
+
+        entries = [p for p in parsed if p is not None]
+        logger.debug("Список еды: user_id=%d  %d позиций", uid, len(entries))
+        _log_user_msg(update, extra=f"список еды: {len(entries)} позиций")
+        return await _save_entries(update, context, entries)
 
     # Кнопка из истории: "📌 Название • 350 ккал"
     import re
@@ -834,6 +885,55 @@ async def _save_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     msg = (
         f"✅ {badge} *{name}* — {kcal} ккал добавлено!\n\n"
+        f"{bar}\n"
+        f"Съедено: *{total}* ккал"
+        + (f"  |  🔥 Сожжено: *{burned}* ккал" if burned else "") + "\n"
+        f"Чистые калории: *{net}* / {goal} ккал\n"
+    )
+    msg += (
+        f"📉 Ещё можно: *{remaining}* ккал"
+        if remaining > 0 else
+        f"⚠️ Превышение нормы на *{abs(remaining)}* ккал"
+    )
+
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+async def _save_entries(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    entries: list[tuple[str, int]],
+) -> int:
+    """Сохраняет сразу несколько позиций еды и показывает общую сводку."""
+    uid = update.effective_user.id
+
+    for name, kcal in entries:
+        db_add_entry(uid, name, kcal)
+
+    day_entries = db_get_day(uid, _today())
+    total       = sum(r["kcal"] for r in day_entries)
+    burned      = db_workout_kcal_day(uid, _today())
+    net         = total - burned
+    goal        = db_get_goal(uid)
+    remaining   = goal - net
+    bar         = _progress_bar(net, goal)
+
+    added_kcal = sum(kcal for _, kcal in entries)
+    logger.info(
+        "Список еды сохранён: user_id=%d  позиций=%d  добавлено=%d ккал  total=%d  net=%d/%d",
+        uid, len(entries), added_kcal, total, net, goal,
+    )
+    _log_bot_reply(
+        uid,
+        f"✅ список из {len(entries)} позиций добавлен ({added_kcal} ккал) | итого={total} net={net}/{goal}",
+        extra="food-list-saved",
+    )
+
+    lines = "\n".join(f"{_kcal_badge(kcal)} {name} — {kcal} ккал" for name, kcal in entries)
+    msg = (
+        f"✅ Добавлено {len(entries)} позиций ({added_kcal} ккал):\n\n"
+        f"{lines}\n\n"
         f"{bar}\n"
         f"Съедено: *{total}* ккал"
         + (f"  |  🔥 Сожжено: *{burned}* ккал" if burned else "") + "\n"
