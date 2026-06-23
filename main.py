@@ -706,7 +706,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _build_food_keyboard(uid: int) -> ReplyKeyboardMarkup:
     """Клавиатура с последними 15 уникальными продуктами + кнопка отмены."""
-    recent = db_recent_food(uid, limit=16)
+    recent = db_recent_food(uid, limit=30)
     rows = []
     for i in range(0, len(recent), 2):
         pair = []
