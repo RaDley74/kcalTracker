@@ -723,7 +723,7 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _log_user_msg(update, extra="➕ добавить еду — старт")
     logger.debug("Начало добавления еды: user_id=%d", uid)
 
-    recent = db_recent_food(uid, limit=16)
+    recent = db_recent_food(uid, limit=30)
     if recent:
         keyboard = _build_food_keyboard(uid)
         hint = (
